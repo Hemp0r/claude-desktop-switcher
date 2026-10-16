@@ -1217,10 +1217,8 @@ function showCloneRow(name) {
 }
 
 // --- Backend operations -----------------------------------------------------
-// Switching relinks shared/isolated config and launches that environment's
-// Claude. The core refuses to switch while Claude Desktop is running (to avoid
-// config write-back races), so only one environment's Claude runs at a time.
-// Guide the user to quit the running one first instead of showing a dead end.
+// The core permits returning to Existing Claude beside known fully-isolated
+// instances; all other switches require quitting the running Claude first.
 function showSwitchBlocked(name, supportsConcurrent) {
   el.detailFooter.className = 'view-footer split';
   // Fully-isolated environments never need the running Claude quit: point straight
@@ -1243,7 +1241,7 @@ function showSwitchBlocked(name, supportsConcurrent) {
 
 async function doSwitch(name, supportsConcurrent) {
   try {
-    if (await invoke('get_desktop_running_status')) { showSwitchBlocked(name, supportsConcurrent); return; }
+    if (name !== 'default' && await invoke('get_desktop_running_status')) { showSwitchBlocked(name, supportsConcurrent); return; }
     await invoke('switch_profile', { name, noLaunch: false });
     await refreshProfiles();
     withTransition(() => showDetail(name));

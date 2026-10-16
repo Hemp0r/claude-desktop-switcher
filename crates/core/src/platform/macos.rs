@@ -168,6 +168,32 @@ impl PlatformProvider for MacOsProvider {
         desktop_args_from_output(&output)
     }
 
+    fn running_desktop_argv(&self) -> Result<Vec<Vec<String>>> {
+        let mut pids = self.claude_desktop_pids()?;
+        pids.sort_unstable();
+        let expected_executable = self.claude_desktop_app_path().join("Contents/MacOS/Claude");
+        let mut processes = Vec::new();
+        for &pid in &pids {
+            let (executable, argv) = read_process_argv(pid)?;
+            // pgrep is only candidate discovery. Verify the native snapshot,
+            // rather than trusting a matching substring in another argument.
+            if Path::new(&executable) != expected_executable
+                || argv.first().map(String::as_str) != Some(executable.as_str())
+            {
+                return Err(CswError::DesktopRunning);
+            }
+            // Do not discard candidates by a --type substring: an empty,
+            // overridden, or positional type flag can still be a main process.
+            processes.push(argv);
+        }
+        let mut current_pids = self.claude_desktop_pids()?;
+        current_pids.sort_unstable();
+        if current_pids != pids {
+            return Err(CswError::DesktopRunning);
+        }
+        Ok(processes)
+    }
+
     fn running_desktop_processes(&self) -> Result<Vec<(u32, String)>> {
         let pids = self.claude_desktop_pids()?;
         if pids.is_empty() {
@@ -242,6 +268,61 @@ impl PlatformProvider for MacOsProvider {
             },
         )
     }
+}
+
+/// Read native argument boundaries without shell parsing. The kernel API is
+/// documented by Apple's xnu/bsd/kern/kern_sysctl.c (sysctl_procargsx).
+/// Only argv is decoded; any trailing environment bytes stay in this temporary
+/// buffer and are neither interpreted, returned, nor logged.
+fn read_process_argv(pid: u32) -> Result<(String, Vec<String>)> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| CswError::DesktopRunning)?;
+    let mut arg_max: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&arg_max);
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: mib and arg_max are initialized, correctly sized writable storage;
+    // size describes arg_max exactly. Null newp/zero newlen make this read-only.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            (&mut arg_max as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 || size != std::mem::size_of_val(&arg_max) || !(1..=1_048_576).contains(&arg_max)
+    {
+        return Err(CswError::DesktopRunning);
+    }
+    // Use the full kernel limit, not a per-PID size query which can become
+    // stale between calls. KERN_PROCARGS2 adds an argc word to ARG_MAX bytes.
+    let mut bytes = vec![0u8; arg_max as usize + std::mem::size_of::<libc::c_int>()];
+    let mut size = bytes.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: the initialized buffer is live and writable for exactly size
+    // bytes, and mib has three valid entries. The call cannot write past size;
+    // returned lengths are checked before slicing. No process memory pointers
+    // are dereferenced here, and no kernel value is written.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let result = if status != 0 || size > bytes.len() {
+        Err(CswError::DesktopRunning)
+    } else {
+        super::process_args::decode_procargs2(&bytes[..size]).ok_or(CswError::DesktopRunning)
+    };
+    // Shorten the lifetime of unused trailing bytes. This ordinary overwrite
+    // is not a promise of optimizer-resistant secure erasure.
+    bytes.fill(0);
+    result
 }
 
 // Keep command-result validation separate so failures can be tested without

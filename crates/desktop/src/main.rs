@@ -331,8 +331,8 @@ async fn switch_profile(
 
     // Auto-launch after switching, including back to the default ("既存の Claude").
     // For default this resolves to the standard data dirs, so it is equivalent to a
-    // normal Finder/Dock launch; `open -n` starts a fresh LaunchServices process that
-    // inherits no CSW state, and switching is already refused while Claude is running.
+    // normal Finder/Dock launch; switch_to has checked that any running Claude
+    // belongs to a fully-isolated environment before allowing default to reopen.
     if !no_launch {
         let profile = state
             .profile_manager
@@ -503,8 +503,8 @@ async fn reopen_previous_set(
 
     let mut launched: Vec<String> = Vec::new();
     let mut blocked = plan.blocked;
-    // Seat the single non-concurrent environment first: switch_to is refused
-    // while Claude runs, so it must go before any additional windows.
+    // Seat the primary environment first. switch_to rechecks live processes,
+    // including whether default can reopen beside fully-isolated instances.
     if let Some(name) = &plan.active {
         let switcher = ContextSwitcher::new(state.provider.clone(), state.profile_manager.clone());
         if switcher.switch_to(name).is_ok()

@@ -43,23 +43,75 @@ impl ContextSwitcher {
     /// target exists and records it as the active profile. No Keychain or
     /// credential files are touched.
     ///
-    /// Switching is refused while Claude Desktop is running: a live instance can
-    /// write cached state back into the currently active profile's directory and
-    /// race with shared (symlinked) files during the switch, so the user must
-    /// quit Claude Desktop first.
+    /// Switching is refused while Claude Desktop is running, except returning
+    /// to default beside only known fully-isolated instances. Those instances
+    /// share no files with default, so reopening it cannot race on shared files.
     pub fn switch_to(&self, profile_name: &str) -> Result<()> {
         // Validate the profile exists before recording it as active.
         let _ = self.profile_manager.get_profile(profile_name)?;
 
-        // Refuse to switch while Claude Desktop is running to avoid cache
-        // write-back and symlink data races.
         if self.provider.is_claude_desktop_running()? {
-            return Err(CswError::DesktopRunning);
+            if profile_name != "default" {
+                return Err(CswError::DesktopRunning);
+            }
+            let args = self.provider.running_desktop_argv()?;
+            let default_dir = self.provider.claude_desktop_default_dir();
+            if args.is_empty() {
+                return Err(CswError::DesktopRunning);
+            }
+            let isolated_dirs: Vec<_> = self
+                .profile_manager
+                .list_profiles()?
+                .into_iter()
+                .filter(|name| name != "default")
+                .filter_map(|name| self.profile_manager.get_profile(&name).ok())
+                .filter(|p| !p.profile.is_default && p.sharing.is_fully_isolated())
+                .map(|p| p.isolation.desktop_user_data_dir)
+                .collect();
+            // Unrecognized processes or unreadable profiles cannot establish isolation.
+            if !args.iter().all(|argv| {
+                explicit_user_data_dir(argv).is_some_and(|value| {
+                    value != default_dir.as_os_str()
+                        && isolated_dirs.iter().any(|dir| dir.as_os_str() == value)
+                })
+            }) {
+                return Err(CswError::DesktopRunning);
+            }
         }
 
         self.profile_manager.switch_to(profile_name)?;
         Ok(())
     }
+}
+
+/// An explicit, unambiguous data-directory switch from native argv. Display
+/// strings from ps cannot establish this: whitespace inside a value or another
+/// argument is indistinguishable from an actual argument boundary.
+fn explicit_user_data_dir(argv: &[String]) -> Option<&std::ffi::OsStr> {
+    if argv.first().is_none_or(String::is_empty) {
+        return None;
+    }
+    let mut value = None;
+    for arg in argv.iter().skip(1) {
+        // Chromium trims switches and also accepts a single-dash prefix.
+        // Accept only CSW's canonical equals form, and reject aliases rather
+        // than overlooking a later switch that can override the known value.
+        if arg.trim() != arg
+            || arg == "--"
+            || arg == "--user-data-dir"
+            || arg == "-user-data-dir"
+            || arg.starts_with("-user-data-dir=")
+        {
+            return None;
+        }
+        if let Some(candidate) = arg.strip_prefix("--user-data-dir=") {
+            if candidate.is_empty() || value.is_some() {
+                return None;
+            }
+            value = Some(std::ffi::OsStr::new(candidate));
+        }
+    }
+    value
 }
 
 /// Whether a Claude Desktop instance for `target_dir` is currently running.
@@ -151,8 +203,8 @@ pub struct RelaunchEnv {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RelaunchPlan {
     /// The single non-concurrent environment (existing Claude, or a shared/copy
-    /// environment) to switch to first. At most one, and only when nothing else
-    /// is running.
+    /// environment) to switch to first. At most one; existing Claude may also
+    /// reopen beside fully-isolated environments.
     pub active: Option<String>,
     /// Fully-isolated environments to open alongside, in additional windows.
     pub additional: Vec<String>,
@@ -169,23 +221,23 @@ pub struct RelaunchPlan {
 ///   relaunching a running one would double it on the same data directory.
 /// - Fully-isolated environments share nothing and run side by side, so they go
 ///   to `additional`.
-/// - The existing Claude and shared/copy environments run one at a time. With
-///   nothing running, one is chosen as `active`; the rest go to `blocked`. If
-///   any Claude is already running, `switch_to` would be refused, so all
-///   non-concurrent candidates are `blocked`.
+/// - With nothing running, one existing Claude or shared/copy environment is
+///   chosen as `active`; the rest go to `blocked`. Existing Claude may also
+///   reopen when only fully-isolated environments run. `switch_to` rechecks
+///   the live processes before executing the plan.
 ///
-/// `envs` describes every known environment; entries in `recorded` or `running`
-/// with no matching env are ignored (e.g. an environment deleted since capture).
+/// `envs` describes every known environment; unknown recorded names are ignored.
+/// The default-reopen exception requires every running name to be known and isolated.
 pub fn plan_relaunch(
     recorded: &[String],
     running: &[String],
     envs: &[RelaunchEnv],
 ) -> RelaunchPlan {
     let lookup = |name: &str| envs.iter().find(|e| e.name == name);
-    // Any Claude running at all blocks a switch_to (its guard refuses while
-    // Claude Desktop runs), so a non-concurrent environment can only seat when
-    // nothing is running.
-    let anything_running = running.iter().any(|n| lookup(n).is_some());
+    let anything_running = !running.is_empty();
+    let only_isolated_running = running
+        .iter()
+        .all(|n| lookup(n).is_some_and(|e| !e.is_default && e.is_fully_isolated));
 
     let mut plan = RelaunchPlan::default();
     for name in recorded {
@@ -197,7 +249,9 @@ pub fn plan_relaunch(
         };
         if !env.is_default && env.is_fully_isolated {
             plan.additional.push(name.clone());
-        } else if !anything_running && plan.active.is_none() {
+        } else if plan.active.is_none()
+            && (!anything_running || env.is_default && only_isolated_running)
+        {
             plan.active = Some(name.clone());
         } else {
             plan.blocked.push(name.clone());
@@ -274,6 +328,195 @@ mod tests {
         let switcher = ContextSwitcher::new(provider, pm.clone());
         switcher.switch_to("Work").unwrap();
         assert_eq!(pm.active_profile_name(), "Work");
+    }
+
+    /// Spec §4: default can reopen beside only known fully-isolated instances.
+    #[test]
+    fn switch_to_default_checks_every_running_environment() {
+        use crate::profile::SharingMode;
+
+        let cases: &[(&[&str], &str, bool)] = &[
+            (&["Iso1"], "default", true),
+            (&["Iso1", "Iso2"], "default", true),
+            (&["unmanaged"], "default", false),
+            (&["default"], "default", false),
+            (&["Iso1", "default"], "default", false),
+            (&["Iso1", "default-empty-type"], "default", false),
+            (&["Iso1", "default-reset-type"], "default", false),
+            (&["Iso1", "default-positional-type"], "default", false),
+            (&["Shared"], "default", false),
+            (&["Copied"], "default", false),
+            (&["Unknown"], "default", false),
+            (&["Iso1", "Unknown"], "default", false),
+            (&["Iso1", "Shared"], "default", false),
+            (&[], "default", false),
+            (&["Iso1"], "Iso2", false),
+        ];
+        for (running, target, allowed) in cases {
+            let root = tempdir().unwrap();
+            let desktop = root.path().join("Application Support/Claude");
+            let cli = root.path().join("cli");
+            let app = root.path().join("app");
+            let args = running
+                .iter()
+                .map(|name| {
+                    if *name == "unmanaged" {
+                        return vec!["/Applications/Claude.app/Contents/MacOS/Claude".to_string()];
+                    }
+                    let type_args: &[&str] = match *name {
+                        "default-empty-type" => &["--type="],
+                        "default-reset-type" => &["--type=renderer", "--type="],
+                        "default-positional-type" => &["--", "--type=renderer"],
+                        _ => &[],
+                    };
+                    if !type_args.is_empty() {
+                        let mut argv =
+                            vec!["/Applications/Claude.app/Contents/MacOS/Claude".to_string()];
+                        argv.extend(type_args.iter().map(|arg| (*arg).to_string()));
+                        return argv;
+                    }
+                    let dir = if *name == "default" {
+                        desktop.clone()
+                    } else {
+                        app.join("profiles").join(name).join("desktop-data")
+                    };
+                    vec![
+                        "/Applications/Claude.app/Contents/MacOS/Claude".to_string(),
+                        format!("--user-data-dir={}", dir.display()),
+                    ]
+                })
+                .collect();
+            let provider = Arc::new(
+                MockPlatformProvider::new(desktop, cli, app)
+                    .with_desktop_running(true)
+                    .with_running_argv(args),
+            );
+            let pm = Arc::new(ProfileManager::new(provider.clone()).unwrap());
+            for name in ["Iso1", "Iso2"] {
+                pm.create_profile(name, SharingConfig::default(), None)
+                    .unwrap();
+            }
+            pm.create_profile("Shared", SharingConfig::share_settings_preset(), None)
+                .unwrap();
+            pm.create_profile(
+                "Copied",
+                SharingConfig {
+                    cli_settings: SharingMode::Copy,
+                    ..SharingConfig::default()
+                },
+                None,
+            )
+            .unwrap();
+            pm.switch_to("Iso1").unwrap();
+
+            let switcher = ContextSwitcher::new(provider, pm.clone());
+            let result = switcher.switch_to(target);
+            if *allowed {
+                result.unwrap();
+                assert_eq!(pm.active_profile_name(), "default");
+            } else {
+                assert!(
+                    matches!(result, Err(CswError::DesktopRunning)),
+                    "running={running:?}, target={target}, result={result:?}"
+                );
+                assert_eq!(pm.active_profile_name(), "Iso1");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_relaunch_blocks_unknown_running_environments() {
+        for running in [
+            vec!["Unknown".into()],
+            vec!["Iso1".into(), "Unknown".into()],
+        ] {
+            let plan = plan_relaunch(
+                &["default".into(), "Shared".into(), "Iso2".into()],
+                &running,
+                &envs(),
+            );
+            assert_eq!(plan.active, None);
+            assert_eq!(
+                plan.blocked,
+                vec!["default".to_string(), "Shared".to_string()]
+            );
+            assert_eq!(plan.additional, vec!["Iso2".to_string()]);
+        }
+    }
+
+    #[test]
+    fn switch_to_default_requires_exact_native_arguments() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["--user-data-dir={dir}"], true),
+            (&["--user-data-dir", "{dir}"], false),
+            (&["--user-data-dir={dir}", "--enable-logging"], true),
+            (&["--user-data-dir={dir} extra"], false),
+            (&["--user-data-dir={dir}2"], false),
+            (&["--other=--user-data-dir={dir}"], false),
+            (&["--other=prefix --user-data-dir={dir}"], false),
+            (
+                &["--user-data-dir={dir}", "--user-data-dir=/unknown"],
+                false,
+            ),
+            (
+                &["--user-data-dir=/unknown", "--user-data-dir={dir}"],
+                false,
+            ),
+            (
+                &["--user-data-dir={dir}", "--user-data-dir", "/unknown"],
+                false,
+            ),
+            (&["--user-data-dir={dir}", "--user-data-dir={dir}"], false),
+            (&["--user-data-dir={dir}", "-user-data-dir=/unknown"], false),
+            (
+                &["--user-data-dir={dir}", " --user-data-dir=/unknown"],
+                false,
+            ),
+            (
+                &["--user-data-dir={dir}", "--user-data-dir=/unknown "],
+                false,
+            ),
+            (&["-user-data-dir={dir}"], false),
+            (&["--", "--user-data-dir={dir}"], false),
+            (&["--user-data-dir"], false),
+            (&["--user-data-dir="], false),
+            (&[], false),
+        ];
+        for (arguments, allowed) in cases {
+            let root = tempdir().unwrap();
+            let app = root.path().join("app with spaces");
+            let dir = app.join("profiles/Iso1/desktop-data");
+            let mut argv = vec!["/Applications/Claude.app/Contents/MacOS/Claude".to_string()];
+            argv.extend(
+                arguments
+                    .iter()
+                    .map(|arg| arg.replace("{dir}", &dir.to_string_lossy())),
+            );
+            let provider = Arc::new(
+                MockPlatformProvider::new(
+                    root.path().join("default"),
+                    root.path().join("cli"),
+                    app,
+                )
+                .with_desktop_running(true)
+                .with_running_args(vec![argv.join(" ")])
+                .with_running_argv(vec![argv]),
+            );
+            let pm = Arc::new(ProfileManager::new(provider.clone()).unwrap());
+            pm.create_profile("Iso1", SharingConfig::default(), None)
+                .unwrap();
+            pm.switch_to("Iso1").unwrap();
+            let result = ContextSwitcher::new(provider, pm.clone()).switch_to("default");
+            assert_eq!(
+                result.is_ok(),
+                *allowed,
+                "arguments={arguments:?}, result={result:?}"
+            );
+            assert_eq!(
+                pm.active_profile_name(),
+                if *allowed { "default" } else { "Iso1" }
+            );
+        }
     }
 
     use std::path::Path;
@@ -532,6 +775,30 @@ mod tests {
         assert_eq!(plan.active, None);
         assert_eq!(plan.additional, vec!["Iso1".to_string()]);
         assert_eq!(plan.blocked, vec!["Shared".to_string()]);
+    }
+
+    #[test]
+    fn plan_relaunch_reopens_default_beside_isolated() {
+        let plan = plan_relaunch(
+            &[
+                "default".into(),
+                "Iso1".into(),
+                "Iso2".into(),
+                "Shared".into(),
+            ],
+            &["Iso1".into()],
+            &envs(),
+        );
+        assert_eq!(plan.active.as_deref(), Some("default"));
+        assert_eq!(plan.additional, vec!["Iso2".to_string()]);
+        assert_eq!(plan.blocked, vec!["Shared".to_string()]);
+    }
+
+    #[test]
+    fn plan_relaunch_blocks_default_beside_shared() {
+        let plan = plan_relaunch(&["default".into()], &["Shared".into()], &envs());
+        assert_eq!(plan.active, None);
+        assert_eq!(plan.blocked, vec!["default".to_string()]);
     }
 
     #[test]

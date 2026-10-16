@@ -585,6 +585,7 @@ dependencies = [
  "csw-core",
  "dirs",
  "humantime",
+ "libc",
  "objc2-app-kit",
  "serde",
  "serde_json",

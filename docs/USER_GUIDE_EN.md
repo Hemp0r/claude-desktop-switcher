@@ -93,6 +93,8 @@ Here is the daily usage flow after setup. No manual configuration is required.
 > **Note: running environments at the same time**
 > Environments created with "separate conversations and memory too" or "separate the account only" share settings, so they open one at a time to avoid configuration conflicts. To go back to your personal setup, quit the running Claude, select "Existing Claude" in the sidebar and press "Launch Existing Claude". It returns to your Existing Claude and opens it. An environment set to "separate everything" shares nothing, so you can open it alongside a running Claude with "Launch alongside" in the detail view, without quitting.
 
+> If every running Claude belongs to an environment set to "separate everything", press "Launch Existing Claude" without quitting them. The same action reopens Existing Claude if it exits while those environments stay open.
+
 ### Scenario B: Using Claude Code in the terminal
 There are two kinds of terminal, and they need different steps. In either case, the first time you use Claude Code in an environment, you need to sign in to the CLI once (see "First time only: signing in to Claude Code" below).
 
@@ -192,6 +194,7 @@ Yes. Press **"Check the current environment"** in the menu bar icon's menu: CSW 
 **Q. Can an update to Claude Desktop take me out of my environment?**
 Yes, it can happen. The automatic relaunch after an update does not go through CSW, so the reopened Claude runs on Existing Claude's data. The window looks the same, but the "In use" marker in CSW moves to Existing Claude, and if CSW is running, the settings window shows a notice. To continue in your environment, quit Claude and press "Launch this environment" again.
 
+Claude's own automatic update can also close Existing Claude while it is idle, leaving other environments open. If every remaining Claude is fully isolated, use "Launch Existing Claude" to reopen it without quitting them. "Reopen" applies the same rule when restoring it. Applying the update still waits for every Claude to quit, so reopening does not complete the update. CSW does not change Claude's update settings.
+
 **Q. Reopening every environment by hand after each update is tedious.**
 Applying an update requires quitting every running Claude (the app's updater waits for them all to quit before it swaps the app). So CSW remembers the environments that were open together the last time you quit them all, and a single "Reopen" in the settings window banner opens them again. Environments already running are skipped automatically. If a shared environment cannot run alongside another Claude, only that one is flagged with "quit the Claude that is running" first. Nothing launches automatically; it opens only when you press the button.
-
