@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use crate::error::{CswError, Result};
 use crate::platform::PlatformProvider;
@@ -127,16 +127,7 @@ impl PlatformProvider for MacOsProvider {
             .arg("Claude.app/Contents/MacOS/Claude")
             .output()?;
 
-        if !output.status.success() {
-            return Ok(vec![]);
-        }
-
-        let pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| line.trim().parse().ok())
-            .collect();
-
-        Ok(pids)
+        desktop_pids_from_output(&output)
     }
 
     fn move_to_trash(&self, path: &std::path::Path) -> Result<()> {
@@ -166,17 +157,15 @@ impl PlatformProvider for MacOsProvider {
             .join(",");
         // `ps -o args=` prints one full command line per pid, no header.
         let output = Command::new("ps")
+            // In the C locale, macOS ps escapes non-ASCII paths into M-/^
+            // notation, which would hide running environments from matching.
+            .env("LC_ALL", "en_US.UTF-8")
             .arg("-p")
             .arg(pid_list)
             .arg("-o")
             .arg("args=")
             .output()?;
-        if !output.status.success() {
-            return Ok(vec![]);
-        }
-        Ok(main_process_arg_lines(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
+        desktop_args_from_output(&output)
     }
 
     fn running_desktop_argv(&self) -> Result<Vec<Vec<String>>> {
@@ -338,6 +327,75 @@ fn read_process_argv(pid: u32) -> Result<(String, Vec<String>)> {
     result
 }
 
+// Keep command-result validation separate so failures can be tested without
+// inspecting or stopping real applications. Only pgrep's documented no-match
+// exit is evidence of no processes; ps failures require the caller to retry.
+fn desktop_pids_from_output(output: &Output) -> Result<Vec<u32>> {
+    if output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok(vec![]);
+    }
+    let stdout = process_inspection_stdout("pgrep", output)?;
+    let pids: Vec<u32> = stdout
+        .lines()
+        .map(|line| {
+            line.trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|pid| *pid > 0)
+                .ok_or_else(|| {
+                    CswError::Other(
+                        "Could not inspect running Claude Desktop processes: invalid pgrep PID"
+                            .into(),
+                    )
+                })
+        })
+        .collect::<Result<_>>()?;
+    if pids.is_empty() {
+        return Err(CswError::Other(
+            "Could not inspect running Claude Desktop processes: pgrep returned no PIDs on success"
+                .into(),
+        ));
+    }
+    Ok(pids)
+}
+
+fn desktop_args_from_output(output: &Output) -> Result<Vec<String>> {
+    let stdout = process_inspection_stdout("ps", output)?;
+    if stdout.trim().is_empty() {
+        return Err(CswError::Other(
+            "Could not inspect running Claude Desktop processes: ps returned no arguments. Try again."
+                .into(),
+        ));
+    }
+    // macOS ps can exit successfully even when retrieving a process's
+    // arguments fails, emitting only `(comm)` for that row. A partial list
+    // must not be used to authorize deletion of a potentially running target.
+    if stdout.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with('(') && line.ends_with(')')
+    }) {
+        return Err(CswError::Other(
+            "Could not inspect running Claude Desktop processes: ps could not read arguments. Try again."
+                .into(),
+        ));
+    }
+    Ok(main_process_arg_lines(stdout))
+}
+
+fn process_inspection_stdout<'a>(command: &str, output: &'a Output) -> Result<&'a str> {
+    if !output.status.success() {
+        return Err(CswError::Other(format!(
+            "Could not inspect running Claude Desktop processes: {command} failed ({}). Try again.",
+            output.status,
+        )));
+    }
+    std::str::from_utf8(&output.stdout).map_err(|_| {
+        CswError::Other(format!(
+            "Could not inspect running Claude Desktop processes: {command} returned invalid UTF-8",
+        ))
+    })
+}
+
 /// Keep only the Claude Desktop *main* process lines from `ps -o args=` output.
 /// Electron spawns helper processes (`--type=renderer`, `--type=gpu-process`, …)
 /// that do not represent a running environment; only the main process carries the
@@ -377,6 +435,69 @@ fn main_process_pid_lines(ps_output: &str) -> Vec<(u32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process_output(status: i32, stdout: &[u8]) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.to_vec(),
+            stderr: vec![],
+        }
+    }
+
+    #[test]
+    fn process_inspection_distinguishes_no_matches_from_pgrep_failure() {
+        assert!(
+            desktop_pids_from_output(&process_output(1 << 8, b""))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            desktop_pids_from_output(&process_output(0, b"42\n84\n")).unwrap(),
+            vec![42, 84]
+        );
+        for status in [2 << 8, 3 << 8, 9] {
+            assert!(desktop_pids_from_output(&process_output(status, b"")).is_err());
+        }
+    }
+
+    #[test]
+    fn process_inspection_rejects_unreadable_pid_lists() {
+        for stdout in [b"42\nbad-pid\n".as_slice(), b"\xff", b"0\n", b""] {
+            assert!(desktop_pids_from_output(&process_output(0, stdout)).is_err());
+        }
+    }
+
+    #[test]
+    fn process_inspection_rejects_ps_failure_even_after_processes_exit() {
+        // A pid can exit between pgrep and ps. Refuse this attempt; a retry
+        // can establish that no matching process remains.
+        for status in [1 << 8, 2 << 8, 9] {
+            assert!(desktop_args_from_output(&process_output(status, b"")).is_err());
+        }
+    }
+
+    #[test]
+    fn process_inspection_rejects_unreadable_args() {
+        for stdout in [
+            b"\xff".as_slice(),
+            b"",
+            b" \n",
+            b"(Claude)\n",
+            b"/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=/test/other\n(Claude)\n",
+        ] {
+            assert!(desktop_args_from_output(&process_output(0, stdout)).is_err());
+        }
+    }
+
+    #[test]
+    fn process_inspection_keeps_successful_main_process_args() {
+        let args = b"/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=/test/Environment Data\n";
+        assert_eq!(
+            desktop_args_from_output(&process_output(0, args)).unwrap(),
+            vec![String::from_utf8(args.to_vec()).unwrap().trim().to_string()]
+        );
+    }
 
     #[test]
     fn main_process_pid_lines_pairs_pid_with_main_and_drops_helpers() {
@@ -476,6 +597,48 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The parent may use the C locale, where macOS ps escapes non-ASCII
+    /// arguments. Exercise the real inspection with only this test process,
+    /// without creating a profile or starting Claude.
+    #[test]
+    fn running_desktop_args_preserve_unicode_paths_in_c_locale() {
+        const PROBE: &str = "CSW_TEST_UNICODE_CLAUDE_PROBE";
+        const TARGET: &str = "/nonexistent/csw-test/仕事/desktop-data";
+        if std::env::var_os(PROBE).is_some() {
+            let provider = MacOsProvider::new();
+            let args = provider.running_desktop_args().unwrap();
+            assert!(
+                crate::switcher::desktop_dir_running(
+                    Path::new(TARGET),
+                    &args,
+                    &provider.claude_desktop_default_dir(),
+                ),
+                "the running Unicode target must match even with LC_ALL=C",
+            );
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg0(format!(
+                "/nonexistent/csw-test/Claude.app/Contents/MacOS/Claude --user-data-dir={TARGET}"
+            ))
+            .args([
+                "--exact",
+                "platform::macos::tests::running_desktop_args_preserve_unicode_paths_in_c_locale",
+                "--test-threads=1",
+            ])
+            .env(PROBE, "1")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the Unicode process probe must succeed: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     /// A Claude that hosts the terminal running csw (the Claude CSW opened, or

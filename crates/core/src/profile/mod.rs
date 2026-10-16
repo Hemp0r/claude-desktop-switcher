@@ -742,7 +742,8 @@ impl ProfileManager {
     }
 
     /// Shared validation for both delete flavors: never the default, never
-    /// the active environment. Returns the profile directory.
+    /// the active environment or a running environment. Inspection errors must
+    /// also stop deletion before moving, unlinking or removing anything.
     fn validate_deletable(&self, name: &str) -> Result<PathBuf> {
         if name == "default" {
             return Err(CswError::DefaultProfileCannotBeDeleted);
@@ -753,7 +754,15 @@ impl ProfileManager {
         }
 
         // Ensure the profile exists (and the name is valid) before touching disk.
-        self.get_profile(name)?;
+        let profile = self.get_profile(name)?;
+        let running_args = self.provider.running_desktop_args()?;
+        if crate::switcher::desktop_dir_running(
+            &profile.isolation.desktop_user_data_dir,
+            &running_args,
+            &self.provider.claude_desktop_default_dir(),
+        ) {
+            return Err(CswError::RunningProfileCannotBeDeleted(name.to_string()));
+        }
 
         let profiles_dir = self.app_config.lock().unwrap().profiles_dir.clone();
         Ok(profiles_dir.join(name))

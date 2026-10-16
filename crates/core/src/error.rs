@@ -23,6 +23,11 @@ pub enum CswError {
     #[error("Active profile '{0}' cannot be deleted. Switch to another profile first.")]
     ActiveProfileCannotBeDeleted(String),
 
+    #[error(
+        "Environment '{0}' is running. Quit Claude Desktop for this environment before deleting it."
+    )]
+    RunningProfileCannotBeDeleted(String),
+
     #[error("Symlink creation failed: {source} -> {target}")]
     SymlinkFailed {
         source: String,

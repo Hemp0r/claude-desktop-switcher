@@ -133,6 +133,7 @@ The Claude Code (CLI) sign-in is managed separately from the desktop app's sign-
   [Privacy and Transparency](PRIVACY_EN.md) lists every path this app reads, every path it writes, and everything it never touches, together with the steps to verify on your own Mac that it makes no network requests. We publish the verification steps, not just the claims.
 * **Deleting an environment by mistake is recoverable**
   Deleting an environment simply moves its folder to the macOS Trash. Until you empty the Trash, nothing is lost, including the sign-in state and share links. To bring it back, move the folder from the Trash into `~/.context-switcher-claude/profiles/`; when you return to the CSW window, it reappears in the list as is. If you want it gone immediately, choose "Delete permanently" in the confirmation (it skips the Trash and cannot be undone).
+  A running environment cannot be moved to the Trash or permanently deleted. Quit Claude for that environment and try again. Deletion also stops if CSW cannot check whether it is running. Your existing Claude and the active environment cannot be deleted either. To delete the active environment, quit Claude and switch to another environment first.
 * **See where this environment's data lives and how much there is**
   Open "Location of this environment's data" in the detail screen to see, beyond the folder paths, how much space the environment occupies by itself, the approximate size of each folder, and a per-item breakdown. Shared items show their link target; everything else shows its approximate size and last-modified date. Only file names, sizes, and dates are read for this; contents are never opened. Each folder opens directly with "Show in Finder", which also makes backups straightforward.
 * **Check anytime that the isolation still holds**
@@ -197,4 +198,3 @@ Claude's own automatic update can also close Existing Claude while it is idle, l
 
 **Q. Reopening every environment by hand after each update is tedious.**
 Applying an update requires quitting every running Claude (the app's updater waits for them all to quit before it swaps the app). So CSW remembers the environments that were open together the last time you quit them all, and a single "Reopen" in the settings window banner opens them again. Environments already running are skipped automatically. If a shared environment cannot run alongside another Claude, only that one is flagged with "quit the Claude that is running" first. Nothing launches automatically; it opens only when you press the button.
-
