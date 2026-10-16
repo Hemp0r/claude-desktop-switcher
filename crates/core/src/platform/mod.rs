@@ -1,3 +1,6 @@
+#[cfg(any(target_os = "macos", test))]
+mod process_args;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 
@@ -67,6 +70,14 @@ pub trait PlatformProvider: Send + Sync {
     /// command line, used to tell which environment (`--user-data-dir`) is running.
     /// Empty when no Claude is running.
     fn running_desktop_args(&self) -> Result<Vec<String>>;
+
+    /// Native argv of every observed Claude main process, preserving argument
+    /// boundaries. Used for safety decisions, never reconstructed from ps text.
+    /// Unavailable or incomplete observations must return an error or an empty
+    /// result, never a partial list that could incorrectly establish isolation.
+    fn running_desktop_argv(&self) -> Result<Vec<Vec<String>>> {
+        Ok(Vec::new())
+    }
 
     /// The `(pid, args line)` of each running Claude Desktop *main* process. Same
     /// filtering as [`running_desktop_args`], but keeps the pid so a specific

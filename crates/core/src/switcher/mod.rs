@@ -54,9 +54,9 @@ impl ContextSwitcher {
             if profile_name != "default" {
                 return Err(CswError::DesktopRunning);
             }
-            let args = self.provider.running_desktop_args()?;
+            let args = self.provider.running_desktop_argv()?;
             let default_dir = self.provider.claude_desktop_default_dir();
-            if args.is_empty() || desktop_dir_running(&default_dir, &args, &default_dir) {
+            if args.is_empty() {
                 return Err(CswError::DesktopRunning);
             }
             let isolated_dirs: Vec<_> = self
@@ -69,10 +69,11 @@ impl ContextSwitcher {
                 .map(|p| p.isolation.desktop_user_data_dir)
                 .collect();
             // Unrecognized processes or unreadable profiles cannot establish isolation.
-            if !args.iter().all(|line| {
-                isolated_dirs
-                    .iter()
-                    .any(|dir| desktop_dir_running(dir, std::slice::from_ref(line), &default_dir))
+            if !args.iter().all(|argv| {
+                explicit_user_data_dir(argv).is_some_and(|value| {
+                    value != default_dir.as_os_str()
+                        && isolated_dirs.iter().any(|dir| dir.as_os_str() == value)
+                })
             }) {
                 return Err(CswError::DesktopRunning);
             }
@@ -81,6 +82,36 @@ impl ContextSwitcher {
         self.profile_manager.switch_to(profile_name)?;
         Ok(())
     }
+}
+
+/// An explicit, unambiguous data-directory switch from native argv. Display
+/// strings from ps cannot establish this: whitespace inside a value or another
+/// argument is indistinguishable from an actual argument boundary.
+fn explicit_user_data_dir(argv: &[String]) -> Option<&std::ffi::OsStr> {
+    if argv.first().is_none_or(String::is_empty) {
+        return None;
+    }
+    let mut value = None;
+    for arg in argv.iter().skip(1) {
+        // Chromium trims switches and also accepts a single-dash prefix.
+        // Accept only CSW's canonical equals form, and reject aliases rather
+        // than overlooking a later switch that can override the known value.
+        if arg.trim() != arg
+            || arg == "--"
+            || arg == "--user-data-dir"
+            || arg == "-user-data-dir"
+            || arg.starts_with("-user-data-dir=")
+        {
+            return None;
+        }
+        if let Some(candidate) = arg.strip_prefix("--user-data-dir=") {
+            if candidate.is_empty() || value.is_some() {
+                return None;
+            }
+            value = Some(std::ffi::OsStr::new(candidate));
+        }
+    }
+    value
 }
 
 /// Whether a Claude Desktop instance for `target_dir` is currently running.
@@ -203,7 +234,7 @@ pub fn plan_relaunch(
     envs: &[RelaunchEnv],
 ) -> RelaunchPlan {
     let lookup = |name: &str| envs.iter().find(|e| e.name == name);
-    let anything_running = running.iter().any(|n| lookup(n).is_some());
+    let anything_running = !running.is_empty();
     let only_isolated_running = running
         .iter()
         .all(|n| lookup(n).is_some_and(|e| !e.is_default && e.is_fully_isolated));
@@ -310,6 +341,9 @@ mod tests {
             (&["unmanaged"], "default", false),
             (&["default"], "default", false),
             (&["Iso1", "default"], "default", false),
+            (&["Iso1", "default-empty-type"], "default", false),
+            (&["Iso1", "default-reset-type"], "default", false),
+            (&["Iso1", "default-positional-type"], "default", false),
             (&["Shared"], "default", false),
             (&["Copied"], "default", false),
             (&["Unknown"], "default", false),
@@ -327,23 +361,36 @@ mod tests {
                 .iter()
                 .map(|name| {
                     if *name == "unmanaged" {
-                        return "/Applications/Claude.app/Contents/MacOS/Claude".to_string();
+                        return vec!["/Applications/Claude.app/Contents/MacOS/Claude".to_string()];
+                    }
+                    let type_args: &[&str] = match *name {
+                        "default-empty-type" => &["--type="],
+                        "default-reset-type" => &["--type=renderer", "--type="],
+                        "default-positional-type" => &["--", "--type=renderer"],
+                        _ => &[],
+                    };
+                    if !type_args.is_empty() {
+                        let mut argv = vec![
+                            "/Applications/Claude.app/Contents/MacOS/Claude".to_string(),
+                        ];
+                        argv.extend(type_args.iter().map(|arg| (*arg).to_string()));
+                        return argv;
                     }
                     let dir = if *name == "default" {
                         desktop.clone()
                     } else {
                         app.join("profiles").join(name).join("desktop-data")
                     };
-                    format!(
-                        "/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir={}",
-                        dir.display()
-                    )
+                    vec![
+                        "/Applications/Claude.app/Contents/MacOS/Claude".to_string(),
+                        format!("--user-data-dir={}", dir.display()),
+                    ]
                 })
                 .collect();
             let provider = Arc::new(
                 MockPlatformProvider::new(desktop, cli, app)
                     .with_desktop_running(true)
-                    .with_running_args(args),
+                    .with_running_argv(args),
             );
             let pm = Arc::new(ProfileManager::new(provider.clone()).unwrap());
             for name in ["Iso1", "Iso2"] {
@@ -375,6 +422,86 @@ mod tests {
                 );
                 assert_eq!(pm.active_profile_name(), "Iso1");
             }
+        }
+    }
+
+    #[test]
+    fn plan_relaunch_blocks_unknown_running_environments() {
+        for running in [
+            vec!["Unknown".into()],
+            vec!["Iso1".into(), "Unknown".into()],
+        ] {
+            let plan = plan_relaunch(
+                &["default".into(), "Shared".into(), "Iso2".into()],
+                &running,
+                &envs(),
+            );
+            assert_eq!(plan.active, None);
+            assert_eq!(
+                plan.blocked,
+                vec!["default".to_string(), "Shared".to_string()]
+            );
+            assert_eq!(plan.additional, vec!["Iso2".to_string()]);
+        }
+    }
+
+    #[test]
+    fn switch_to_default_requires_exact_native_arguments() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["--user-data-dir={dir}"], true),
+            (&["--user-data-dir", "{dir}"], false),
+            (&["--user-data-dir={dir}", "--enable-logging"], true),
+            (&["--user-data-dir={dir} extra"], false),
+            (&["--user-data-dir={dir}2"], false),
+            (&["--other=--user-data-dir={dir}"], false),
+            (&["--other=prefix --user-data-dir={dir}"], false),
+            (&["--user-data-dir={dir}", "--user-data-dir=/unknown"], false),
+            (&["--user-data-dir=/unknown", "--user-data-dir={dir}"], false),
+            (&["--user-data-dir={dir}", "--user-data-dir", "/unknown"], false),
+            (&["--user-data-dir={dir}", "--user-data-dir={dir}"], false),
+            (&["--user-data-dir={dir}", "-user-data-dir=/unknown"], false),
+            (&["--user-data-dir={dir}", " --user-data-dir=/unknown"], false),
+            (&["--user-data-dir={dir}", "--user-data-dir=/unknown "], false),
+            (&["-user-data-dir={dir}"], false),
+            (&["--", "--user-data-dir={dir}"], false),
+            (&["--user-data-dir"], false),
+            (&["--user-data-dir="], false),
+            (&[], false),
+        ];
+        for (arguments, allowed) in cases {
+            let root = tempdir().unwrap();
+            let app = root.path().join("app with spaces");
+            let dir = app.join("profiles/Iso1/desktop-data");
+            let mut argv = vec!["/Applications/Claude.app/Contents/MacOS/Claude".to_string()];
+            argv.extend(
+                arguments
+                    .iter()
+                    .map(|arg| arg.replace("{dir}", &dir.to_string_lossy())),
+            );
+            let provider = Arc::new(
+                MockPlatformProvider::new(
+                    root.path().join("default"),
+                    root.path().join("cli"),
+                    app,
+                )
+                .with_desktop_running(true)
+                .with_running_args(vec![argv.join(" ")])
+                .with_running_argv(vec![argv]),
+            );
+            let pm = Arc::new(ProfileManager::new(provider.clone()).unwrap());
+            pm.create_profile("Iso1", SharingConfig::default(), None)
+                .unwrap();
+            pm.switch_to("Iso1").unwrap();
+            let result = ContextSwitcher::new(provider, pm.clone()).switch_to("default");
+            assert_eq!(
+                result.is_ok(),
+                *allowed,
+                "arguments={arguments:?}, result={result:?}"
+            );
+            assert_eq!(
+                pm.active_profile_name(),
+                if *allowed { "default" } else { "Iso1" }
+            );
         }
     }
 

@@ -15,6 +15,7 @@ pub struct MockPlatformProvider {
     fail_trash: AtomicBool,
     /// Test knob: arg lines returned by `running_desktop_args` (running main procs).
     running_args: std::sync::Mutex<Vec<String>>,
+    running_argv: std::sync::Mutex<Vec<Vec<String>>>,
     /// Test knob: `(pid, args line)` returned by `running_desktop_processes`.
     running_processes: std::sync::Mutex<Vec<(u32, String)>>,
     /// Records the pids passed to `activate_pid`, so tests can assert which
@@ -34,6 +35,7 @@ impl MockPlatformProvider {
             fail_symlink: AtomicBool::new(false),
             fail_trash: AtomicBool::new(false),
             running_args: std::sync::Mutex::new(Vec::new()),
+            running_argv: std::sync::Mutex::new(Vec::new()),
             running_processes: std::sync::Mutex::new(Vec::new()),
             activated: std::sync::Mutex::new(Vec::new()),
             frontmost: std::sync::Mutex::new(crate::platform::FrontmostApp::OtherApp),
@@ -56,6 +58,12 @@ impl MockPlatformProvider {
     /// (the running Claude main processes), for per-environment "in use" tests.
     pub fn with_running_args(self, args: Vec<String>) -> Self {
         *self.running_args.lock().unwrap() = args;
+        self
+    }
+
+    /// Builder: provide native argument boundaries for safety checks.
+    pub fn with_running_argv(self, argv: Vec<Vec<String>>) -> Self {
+        *self.running_argv.lock().unwrap() = argv;
         self
     }
 
@@ -150,6 +158,10 @@ impl PlatformProvider for MockPlatformProvider {
 
     fn running_desktop_args(&self) -> Result<Vec<String>> {
         Ok(self.running_args.lock().unwrap().clone())
+    }
+
+    fn running_desktop_argv(&self) -> Result<Vec<Vec<String>>> {
+        Ok(self.running_argv.lock().unwrap().clone())
     }
 
     fn running_desktop_processes(&self) -> Result<Vec<(u32, String)>> {

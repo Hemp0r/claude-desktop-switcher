@@ -18,6 +18,7 @@ dirs = { workspace = true }
 humantime = "2.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
 trash = "5.2.6"
 # Same version tauri already pulls in; used only to read the frontmost
 # application's PID for the on-demand "which environment is this?" action.
