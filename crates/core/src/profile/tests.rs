@@ -1587,6 +1587,164 @@ fn purge_profile_rejects_default_and_active() {
     );
 }
 
+// Issue #223: deleting an environment must depend on live usage, not only
+// active_profile. All paths and the mock trash remain inside a TempDir.
+fn assert_deletion_refused_without_changes(purge: bool, inspection_fails: bool) {
+    for name in ["busy", "仕事"] {
+        for sharing in [
+            SharingConfig::default(),
+            SharingConfig::share_settings_preset(),
+        ] {
+            let (initial_provider, initial_manager, _tmp) = setup_test_manager();
+            populate_default_sources(
+                &initial_provider.claude_cli_default_dir(),
+                &initial_provider.claude_desktop_default_dir(),
+            );
+            let profile = initial_manager.create_profile(name, sharing, None).unwrap();
+            let desktop_data = profile.isolation.desktop_user_data_dir.join("keep.txt");
+            let cli_data = profile.isolation.cli_config_dir.join("projects/keep.jsonl");
+            fs::write(&desktop_data, "desktop data").unwrap();
+            fs::write(&cli_data, "cli data").unwrap();
+            let profile_dir = initial_provider.app_data_dir().join("profiles").join(name);
+            let metadata = fs::read(profile_dir.join("profile.toml")).unwrap();
+            let shared_link = profile.isolation.cli_config_dir.join("CLAUDE.md");
+            let original_link = fs::read_link(&shared_link).ok();
+            assert_eq!(
+                original_link.is_some(),
+                profile.sharing.cli_claude_md == SharingMode::Share,
+                "the shared fixture must contain a link before deletion is attempted",
+            );
+            let source = initial_provider.claude_cli_default_dir().join("CLAUDE.md");
+            let original_source = fs::read(&source).unwrap();
+
+            let provider = Arc::new(
+                MockPlatformProvider::new(
+                    initial_provider.claude_desktop_default_dir(),
+                    initial_provider.claude_cli_default_dir(),
+                    initial_provider.app_data_dir(),
+                )
+                .with_running_args(vec![
+                    "/Applications/Claude.app/Contents/MacOS/Claude".into(),
+                    format!(
+                        "/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir={}",
+                        profile.isolation.desktop_user_data_dir.display()
+                    ),
+                ])
+                .with_running_args_failure(inspection_fails),
+            );
+            let manager = ProfileManager::new(provider.clone()).unwrap();
+            assert_eq!(manager.active_profile_name(), "default");
+            if !inspection_fails {
+                assert!(
+                    crate::switcher::desktop_dir_running(
+                        &profile.isolation.desktop_user_data_dir,
+                        &provider.running_desktop_args().unwrap(),
+                        &provider.claude_desktop_default_dir(),
+                    ),
+                    "the fixture must really match the running target"
+                );
+            }
+
+            let result = if purge {
+                manager.purge_profile(name)
+            } else {
+                manager.delete_profile(name)
+            };
+            assert!(
+                result.is_err(),
+                "running/unknown environment must survive (purge={purge})"
+            );
+            if inspection_fails {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("process inspection failed")
+                );
+            } else {
+                assert!(
+                    matches!(result.unwrap_err(), CswError::RunningProfileCannotBeDeleted(refused_name) if refused_name == name)
+                );
+            }
+            assert_eq!(fs::read_to_string(&desktop_data).unwrap(), "desktop data");
+            assert_eq!(fs::read_to_string(&cli_data).unwrap(), "cli data");
+            assert_eq!(
+                fs::read(profile_dir.join("profile.toml")).unwrap(),
+                metadata
+            );
+            assert_eq!(fs::read_link(&shared_link).ok(), original_link);
+            assert_eq!(fs::read(&source).unwrap(), original_source);
+            assert!(!provider.mock_trash_dir().exists());
+            assert_eq!(manager.active_profile_name(), "default");
+        }
+    }
+}
+
+#[test]
+fn delete_running_non_active_profile_is_refused() {
+    assert_deletion_refused_without_changes(false, false);
+}
+
+#[test]
+fn purge_running_non_active_profile_is_refused() {
+    assert_deletion_refused_without_changes(true, false);
+}
+
+#[test]
+fn delete_profile_is_refused_when_process_inspection_fails() {
+    assert_deletion_refused_without_changes(false, true);
+}
+
+#[test]
+fn purge_profile_is_refused_when_process_inspection_fails() {
+    assert_deletion_refused_without_changes(true, true);
+}
+
+#[test]
+fn deletion_allows_stopped_target_while_other_environments_run() {
+    for purge in [false, true] {
+        let (initial_provider, manager, _tmp) = setup_test_manager();
+        let target = manager
+            .create_profile("stopped", SharingConfig::default(), None)
+            .unwrap();
+        let other = manager
+            .create_profile("other", SharingConfig::default(), None)
+            .unwrap();
+        let other_data = other.isolation.desktop_user_data_dir.join("keep.txt");
+        fs::write(&other_data, "other environment").unwrap();
+        let provider = Arc::new(
+            MockPlatformProvider::new(
+                initial_provider.claude_desktop_default_dir(),
+                initial_provider.claude_cli_default_dir(),
+                initial_provider.app_data_dir(),
+            )
+            .with_desktop_running(true)
+            .with_running_args(vec![
+                "/Applications/Claude.app/Contents/MacOS/Claude".into(),
+                format!(
+                    "/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir={}",
+                    other.isolation.desktop_user_data_dir.display()
+                ),
+                // A directory with the target as a string prefix is not the target.
+                format!(
+                    "/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir={}-backup",
+                    target.isolation.desktop_user_data_dir.display()
+                ),
+            ]),
+        );
+        let manager = ProfileManager::new(provider.clone()).unwrap();
+        if purge {
+            manager.purge_profile("stopped").unwrap();
+        } else {
+            manager.delete_profile("stopped").unwrap();
+        }
+        assert!(!target.isolation.desktop_user_data_dir.exists());
+        assert_eq!(provider.mock_trash_dir().join("stopped").exists(), !purge);
+        assert_eq!(fs::read_to_string(other_data).unwrap(), "other environment");
+        assert!(manager.get_profile("other").is_ok());
+    }
+}
+
 // ---- Notes, history and last launch ----
 // Spec: docs/proposals/environment-notes-and-last-launch.md. Expectations are
 // derived from the plan, not from the implementation (RED first).

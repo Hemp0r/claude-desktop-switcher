@@ -65,7 +65,8 @@ pub trait PlatformProvider: Send + Sync {
     /// The argument strings of running Claude Desktop *main* processes (Electron
     /// renderer / GPU / utility helpers excluded). Each entry is one instance's
     /// command line, used to tell which environment (`--user-data-dir`) is running.
-    /// Empty when no Claude is running.
+    /// Empty when no Claude is running. Inspection failures must return an error,
+    /// since callers use this result to guard destructive operations.
     fn running_desktop_args(&self) -> Result<Vec<String>>;
 
     /// The `(pid, args line)` of each running Claude Desktop *main* process. Same

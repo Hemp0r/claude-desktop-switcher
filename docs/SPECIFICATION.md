@@ -170,6 +170,7 @@ macOSはアプリのDockアイコンと表示名をアプリバンドル単位�
 - `csw profile create <name> [--mode isolate|share_settings|share_workspace] [--note <text>]`：環境（プロファイル）の作成（既定は`isolate`＝すべて分ける。`share`は`share_settings`の後方互換エイリアス）。`--note`で自由記述メモを添えられる
 - `csw profile note <name> <text>`：環境の自由記述メモを設定する。空文字を渡すとクリアする。メモは1行200文字まで
 - `csw profile list | show <name> | delete <name> [--purge]`：環境（プロファイル）の一覧表示・詳細表示・削除。削除は既定で、環境のフォルダをそのままmacOSのゴミ箱へ移動する（共有リンクはリンクのまま一緒に移動し、既存のClaude側は無傷）。ゴミ箱を空にするまでは、フォルダを`profiles/`へ戻せば、サインイン状態や共有リンクを含めて完全に復元される（一覧への再表示はディレクトリ走査で自動）。`--purge`はゴミ箱を経由せず完全削除する。ゴミ箱への移動に失敗したときは、完全削除へ切り替えずエラーとして伝え、`--purge`を案内する。一覧にはメモと最終起動を、詳細にはさらに作成日時・複製元も表示する
+- **削除前の保護**：GUI・CLIのゴミ箱移動と完全削除は、共通の検証処理で`default`、保存されたアクティブ環境、Claude Desktopがデータディレクトリを使用中の環境の削除を拒否する。起動状態は削除要求ごとに確認し、プロセス検査に失敗した場合も、移動・リンク解除・削除を行わずエラーを返す。別の環境だけが起動中なら、停止中の非アクティブ環境は削除できる。
 - `csw switch <name> [--no-launch]`：環境の切り替え（Tauriと同等の処理を実行）
 - `csw env [<環境名>]`：指定した環境（省略時は現在のアクティブな環境）に対応する環境変数スクリプト（`export CLAUDE_CONFIG_DIR=...`）を出力。
   - **内蔵ターミナル**：`launch_claude_desktop`は`open -n --env CLAUDE_CONFIG_DIR=<profile>/cli-data --args --user-data-dir=<profile>/desktop-data`で起動するため、CSWが起動したClaudeデスクトップアプリの子プロセス（アプリ内蔵ターミナル）は`CLAUDE_CONFIG_DIR`を継承する。`csw env`の実行は不要。

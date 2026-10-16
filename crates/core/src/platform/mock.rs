@@ -13,6 +13,8 @@ pub struct MockPlatformProvider {
     fail_symlink: AtomicBool,
     /// Test knob: make `move_to_trash` fail (to exercise the no-fallback path).
     fail_trash: AtomicBool,
+    /// Test knob: make process inspection fail instead of reporting no processes.
+    fail_running_args: AtomicBool,
     /// Test knob: arg lines returned by `running_desktop_args` (running main procs).
     running_args: std::sync::Mutex<Vec<String>>,
     /// Test knob: `(pid, args line)` returned by `running_desktop_processes`.
@@ -33,6 +35,7 @@ impl MockPlatformProvider {
             desktop_running: AtomicBool::new(false),
             fail_symlink: AtomicBool::new(false),
             fail_trash: AtomicBool::new(false),
+            fail_running_args: AtomicBool::new(false),
             running_args: std::sync::Mutex::new(Vec::new()),
             running_processes: std::sync::Mutex::new(Vec::new()),
             activated: std::sync::Mutex::new(Vec::new()),
@@ -56,6 +59,12 @@ impl MockPlatformProvider {
     /// (the running Claude main processes), for per-environment "in use" tests.
     pub fn with_running_args(self, args: Vec<String>) -> Self {
         *self.running_args.lock().unwrap() = args;
+        self
+    }
+
+    /// Builder: make `running_desktop_args` return an inspection error.
+    pub fn with_running_args_failure(self, fail: bool) -> Self {
+        self.fail_running_args.store(fail, Ordering::SeqCst);
         self
     }
 
@@ -149,6 +158,11 @@ impl PlatformProvider for MockPlatformProvider {
     }
 
     fn running_desktop_args(&self) -> Result<Vec<String>> {
+        if self.fail_running_args.load(Ordering::SeqCst) {
+            return Err(CswError::Other(
+                "mock: process inspection failed".to_string(),
+            ));
+        }
         Ok(self.running_args.lock().unwrap().clone())
     }
 
