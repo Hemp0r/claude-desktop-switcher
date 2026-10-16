@@ -370,9 +370,8 @@ mod tests {
                         _ => &[],
                     };
                     if !type_args.is_empty() {
-                        let mut argv = vec![
-                            "/Applications/Claude.app/Contents/MacOS/Claude".to_string(),
-                        ];
+                        let mut argv =
+                            vec!["/Applications/Claude.app/Contents/MacOS/Claude".to_string()];
                         argv.extend(type_args.iter().map(|arg| (*arg).to_string()));
                         return argv;
                     }
@@ -455,13 +454,28 @@ mod tests {
             (&["--user-data-dir={dir}2"], false),
             (&["--other=--user-data-dir={dir}"], false),
             (&["--other=prefix --user-data-dir={dir}"], false),
-            (&["--user-data-dir={dir}", "--user-data-dir=/unknown"], false),
-            (&["--user-data-dir=/unknown", "--user-data-dir={dir}"], false),
-            (&["--user-data-dir={dir}", "--user-data-dir", "/unknown"], false),
+            (
+                &["--user-data-dir={dir}", "--user-data-dir=/unknown"],
+                false,
+            ),
+            (
+                &["--user-data-dir=/unknown", "--user-data-dir={dir}"],
+                false,
+            ),
+            (
+                &["--user-data-dir={dir}", "--user-data-dir", "/unknown"],
+                false,
+            ),
             (&["--user-data-dir={dir}", "--user-data-dir={dir}"], false),
             (&["--user-data-dir={dir}", "-user-data-dir=/unknown"], false),
-            (&["--user-data-dir={dir}", " --user-data-dir=/unknown"], false),
-            (&["--user-data-dir={dir}", "--user-data-dir=/unknown "], false),
+            (
+                &["--user-data-dir={dir}", " --user-data-dir=/unknown"],
+                false,
+            ),
+            (
+                &["--user-data-dir={dir}", "--user-data-dir=/unknown "],
+                false,
+            ),
             (&["-user-data-dir={dir}"], false),
             (&["--", "--user-data-dir={dir}"], false),
             (&["--user-data-dir"], false),

@@ -291,9 +291,7 @@ fn read_process_argv(pid: u32) -> Result<(String, Vec<String>)> {
             0,
         )
     };
-    if status != 0
-        || size != std::mem::size_of_val(&arg_max)
-        || !(1..=1_048_576).contains(&arg_max)
+    if status != 0 || size != std::mem::size_of_val(&arg_max) || !(1..=1_048_576).contains(&arg_max)
     {
         return Err(CswError::DesktopRunning);
     }
