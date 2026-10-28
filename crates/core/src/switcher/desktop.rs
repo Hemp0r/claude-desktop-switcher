@@ -4,6 +4,11 @@ use crate::profile::Profile;
 
 /// Launch Claude Desktop for the given profile using --user-data-dir
 pub fn launch_desktop(profile: &Profile, provider: &dyn PlatformProvider) -> Result<()> {
+    // Link the Code-tab conversation list before Claude opens it
+    // (SPECIFICATION.md §3「Codeタブの会話一覧」). Like the launch stamp below,
+    // this accompanies the launch and must never turn it into an error.
+    let _ = crate::profile::code_sessions::prepare_launch(profile, provider);
+
     provider.launch_claude_desktop(
         &profile.isolation.desktop_user_data_dir,
         Some(&profile.isolation.cli_config_dir),

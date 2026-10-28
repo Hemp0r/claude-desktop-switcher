@@ -552,6 +552,7 @@ fn doctor_label(key: &str) -> &'static str {
         "desktop_device_id" => "Device ID (ant-did)",
         "desktop_app_config" => "Account sign-in (config.json)",
         "desktop_config" => "Connectors & app settings (claude_desktop_config.json)",
+        "desktop_code_sessions" => "Code tab conversation list (claude-code-sessions/)",
         _ => "Unknown item",
     }
 }
@@ -647,6 +648,33 @@ Not auto-fixed to avoid losing the local copy.",
                     "!!".red().bold(),
                     label,
                     expected_source
+                );
+            }
+            ItemHealth::PendingLaunch {
+                account_folder_exists,
+            } => {
+                if *account_folder_exists {
+                    println!(
+                        "  {} {} share declared; linked on the next launch \
+(or run `csw doctor --fix` now)",
+                        "OK".green(),
+                        label
+                    );
+                } else {
+                    println!(
+                        "  {} {} share declared; linked on a launch after you sign in \
+and open the Code tab",
+                        "OK".green(),
+                        label
+                    );
+                }
+            }
+            ItemHealth::AccountAmbiguous => {
+                println!(
+                    "  {} {} more than one account folder, so the one to share cannot \
+be determined; nothing is linked automatically",
+                    "!!".red().bold(),
+                    label
                 );
             }
             ItemHealth::UnexpectedLink { actual_target } => {

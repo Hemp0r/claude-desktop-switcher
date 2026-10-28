@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::error::{CswError, Result};
 use crate::platform::PlatformProvider;
+use crate::profile::code_sessions;
 use crate::profile::linker::{LINK_ITEMS, item_mode, item_path};
 use crate::profile::{Profile, SharingMode};
 use crate::switcher::desktop_dir_running;
@@ -54,13 +55,25 @@ pub enum ItemHealth {
     IsolatedOk,
     /// Copy/Isolate: a symlink was found where the item must be independent.
     UnexpectedLink { actual_target: String },
+    /// Share, Code-tab conversation list only (`profile::code_sessions`): the
+    /// link does not exist yet and is created on the environment's next launch.
+    /// `account_folder_exists` is false while the environment holds no account
+    /// folder yet (not signed in, or the Code tab never opened).
+    PendingLaunch { account_folder_exists: bool },
+    /// Share, Code-tab conversation list only: the existing Claude or the
+    /// environment holds more than one account folder, so the folder to share
+    /// cannot be determined. Nothing is linked automatically.
+    AccountAmbiguous,
 }
 
 impl ItemHealth {
     pub fn is_issue(&self) -> bool {
         !matches!(
             self,
-            ItemHealth::SharedOk { .. } | ItemHealth::IsolatedOk | ItemHealth::SourceAbsent
+            ItemHealth::SharedOk { .. }
+                | ItemHealth::IsolatedOk
+                | ItemHealth::SourceAbsent
+                | ItemHealth::PendingLaunch { .. }
         )
     }
 }
@@ -109,7 +122,7 @@ impl<'a> Inspector<'a> {
     /// Inspect every linker-managed link point of `profile` against the
     /// sharing source `source_profile` (normally the existing Claude).
     pub fn inspect_profile(&self, profile: &Profile, source_profile: &Profile) -> ProfileReport {
-        let items: Vec<ItemReport> = LINK_ITEMS
+        let mut items: Vec<ItemReport> = LINK_ITEMS
             .iter()
             .map(|item| {
                 let mode = item_mode(profile, item);
@@ -126,6 +139,20 @@ impl<'a> Inspector<'a> {
                 }
             })
             .collect();
+
+        // The Code-tab conversation list follows the link items; its folder
+        // names are only known after sign-in (SPECIFICATION.md §3).
+        let health = code_sessions::inspect(
+            profile,
+            &source_profile.isolation.desktop_user_data_dir,
+            self.provider,
+        );
+        items.push(ItemReport {
+            key: code_sessions::KEY,
+            mode: code_sessions::mode(profile),
+            is_issue: health.is_issue(),
+            health,
+        });
 
         let issue_count = items.iter().filter(|i| i.is_issue).count();
         let running_args = self.provider.running_desktop_args().unwrap_or_default();
@@ -165,6 +192,9 @@ impl<'a> Inspector<'a> {
         let mut fixed = Vec::new();
 
         for item_report in &report.items {
+            if item_report.key == code_sessions::KEY {
+                continue;
+            }
             let occupant = match item_report.health {
                 ItemHealth::WrongTarget { fixable: true, .. } => Occupant::StaleLink,
                 ItemHealth::MissingLink { .. } => Occupant::Nothing,
@@ -197,6 +227,27 @@ impl<'a> Inspector<'a> {
                 return Err(e);
             }
             fixed.push(item_report.key);
+        }
+
+        // The Code-tab conversation list is linked as on launch: the
+        // environment's own list is kept aside, never removed. Moving it under
+        // a running Claude would pull its open list away, so it is skipped
+        // while that environment runs, or when that cannot be determined.
+        let running = self.provider.running_desktop_args().map(|args| {
+            desktop_dir_running(
+                &profile.isolation.desktop_user_data_dir,
+                &args,
+                &self.provider.claude_desktop_default_dir(),
+            )
+        });
+        if matches!(running, Ok(false))
+            && code_sessions::link(
+                profile,
+                &source_profile.isolation.desktop_user_data_dir,
+                self.provider,
+            )?
+        {
+            fixed.push(code_sessions::KEY);
         }
 
         Ok(fixed)

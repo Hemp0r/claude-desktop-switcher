@@ -69,6 +69,7 @@ const EN = {
   '「共有」は既存のClaudeと中身を共通にすること、「コピー」は作成時に一度だけ写して以後は別々、「分離」はこの環境だけで持つことです。':
     '"Shared" keeps the contents in common with your existing Claude; "Copied" duplicates once at creation and they diverge after; "Isolated" means this environment keeps its own.',
   'ワークツリー一覧': 'Worktrees', 'Gitワークツリーとrepoの対応': 'Mapping of Git worktrees to repos',
+  'Codeタブの会話一覧': 'Code tab conversation list',
   '共通ルール': 'Global rules', 'CLAUDE.mdに書いた常時ルール': 'Always-on rules in CLAUDE.md',
   'ルールファイル': 'Rule files', 'rules/に分けて置いた常時ルール': 'Always-on rules kept as files in rules/',
   'プラグイン': 'Plugins', '導入したプラグイン': 'Installed plugins',
@@ -167,6 +168,10 @@ const EN = {
   '正常に分離': 'Isolated (OK)',
   '正常にコピー': 'Copied (OK)',
   '共有元がまだありません': 'Nothing to share yet',
+  '次の起動で共有': 'Shared on next launch',
+  'サインイン後の起動で共有': 'Shared on a launch after sign-in',
+  'アカウントのフォルダが複数あるため、共有するフォルダを決められません。自動では共有しません。':
+    'There is more than one account folder, so the folder to share cannot be determined. It is not shared automatically.',
   '要確認': 'Needs attention',
   '共有元が見つかりません。': 'The shared source is missing.',
   'リンク先が想定と異なります。ターミナルで「csw doctor --fix」を実行すると張り直せます。':
@@ -318,6 +323,9 @@ const DOCTOR_LABELS = {
   cli_sessions: 'セッション状態',
   desktop_app_config: 'アカウントのサインイン情報',
   desktop_config: 'コネクタ・アプリ設定',
+  // Not a share-UI choice: follows cli_project_memory (SPECIFICATION.md §3
+  // 「Codeタブの会話一覧」), so it only appears in the check.
+  desktop_code_sessions: 'Codeタブの会話一覧',
 };
 
 // Mode presets — must mirror SharingConfig::{share_settings,share_workspace}_preset
@@ -682,6 +690,10 @@ function doctorStatus(item) {
     return { status: item.mode === 'copy' ? '正常にコピー' : '正常に分離', issue: false };
   }
   if (st === 'source_absent') return { status: '共有元がまだありません', issue: false };
+  // Code-tab conversation list only: linked by the next CSW launch.
+  if (st === 'pending_launch') {
+    return { status: item.health.account_folder_exists ? '次の起動で共有' : 'サインイン後の起動で共有', issue: false };
+  }
   const unexpectedLink = ALWAYS_ISOLATED_KEYS.includes(item.key)
     ? '常に分離する項目がリンクになっています。'
     : (item.mode === 'copy' ? 'コピーの項目がリンクになっています。' : '分離の項目がリンクになっています。');
@@ -699,6 +711,7 @@ function doctorStatus(item) {
       : '共有のリンクが実体のファイルに置き換わっています。手元の内容を失わないよう、自動では直しません。',
     missing_link: '共有のリンクがありません。ターミナルで「csw doctor --fix」を実行すると作れます。',
     unexpected_link: unexpectedLink,
+    account_ambiguous: 'アカウントのフォルダが複数あるため、共有するフォルダを決められません。自動では共有しません。',
   }[st] || '状態を判定できませんでした。';
   // The three repairs csw doctor --fix performs (inspector.rs): re-point a
   // fixable wrong link, replace an empty folder, create a missing link. The
@@ -2021,10 +2034,11 @@ function devInvoke(cmd, args) {
     case 'inspect_profile': {
       // Healthy sample report for browser QA / screenshots, shaped exactly like
       // the Rust inspector's serde output: lowercase SharingMode values and the
-      // LINK_ITEMS order (share_settings-style environment).
-      const modes = { ...PRESETS.share_settings, cli_sessions: 'isolate', desktop_app_config: 'isolate', desktop_config: 'isolate' };
+      // LINK_ITEMS order, then the Code-tab conversation list (share_settings-style environment).
+      const modes = { ...PRESETS.share_settings, cli_sessions: 'isolate', desktop_app_config: 'isolate', desktop_config: 'isolate', desktop_code_sessions: 'isolate' };
       const order = ['desktop_config', 'cli_settings', 'cli_claude_md', 'cli_rules', 'cli_project_memory', 'cli_plugins',
-        'cli_skills', 'cli_sessions', 'cli_history', 'desktop_worktrees', 'desktop_device_id', 'desktop_app_config'];
+        'cli_skills', 'cli_sessions', 'cli_history', 'desktop_worktrees', 'desktop_device_id', 'desktop_app_config',
+        'desktop_code_sessions'];
       const items = order.map((key) => (modes[key] === 'share'
         ? { key, mode: 'share', health: { state: 'shared_ok', target: '~/.claude/' + key }, is_issue: false }
         : { key, mode: modes[key], health: { state: 'isolated_ok' }, is_issue: false }));

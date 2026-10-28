@@ -1,3 +1,4 @@
+pub mod code_sessions;
 pub mod config;
 pub mod data_map;
 pub mod inspector;
@@ -687,6 +688,12 @@ impl ProfileManager {
         let sharing_source = self.get_profile(&target_profile.sharing.source.profile)?;
         let linker = linker::Linker::new(self.provider.as_ref());
         linker.link_profile(&target_profile, &sharing_source)?;
+        code_sessions::relink_after_clone(
+            &source_profile,
+            &target_profile,
+            &sharing_source.isolation.desktop_user_data_dir,
+            self.provider.as_ref(),
+        )?;
 
         // Save profile metadata
         config::save_profile(&target_profile, &target_toml)?;
@@ -694,12 +701,18 @@ impl ProfileManager {
         Ok(target_profile)
     }
 
+    /// Copy a directory tree. Symlinks are skipped at every depth, as at the
+    /// top level of a duplicate: a nested link (such as the Code-tab list's)
+    /// points into another environment's data and is recreated, not copied.
     fn copy_dir_recursive(&self, src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
         fs::create_dir_all(dst)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
             let ty = entry.file_type()?;
             let target_path = dst.join(entry.file_name());
+            if ty.is_symlink() {
+                continue;
+            }
             if ty.is_dir() {
                 self.copy_dir_recursive(&entry.path(), &target_path)?;
             } else {
