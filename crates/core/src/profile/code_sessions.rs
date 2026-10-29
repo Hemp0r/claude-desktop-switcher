@@ -16,7 +16,9 @@
 //! The environment's folder name is only known after its first sign-in, so
 //! this item cannot be a static `LINK_ITEMS` entry. Its link is created when
 //! CSW launches the environment (and by `csw doctor --fix`), once the existing
-//! Claude and the environment each hold exactly one account folder.
+//! Claude and the environment each hold exactly one account folder. A link
+//! that is already in place counts as shared however many folders appear
+//! later on either side.
 //!
 //! Scan scope (docs/PRIVACY.md): only the names and types of the two folder
 //! levels under `claude-code-sessions/` are listed; file contents are never
@@ -55,8 +57,13 @@ pub fn mode(profile: &Profile) -> SharingMode {
 /// The `<accountUuid>/<organizationUuid>` folders under `desktop_dir`'s index,
 /// sorted. Account folders must be real directories; organization entries may
 /// be directories or symlinks (the shared link itself). Names that are not
-/// UUIDs are ignored. Only names and types are read.
+/// UUIDs are ignored. Only names and types are read. An index folder that is
+/// itself a symlink is never walked through: it yields no folders, so nothing
+/// behind it is ever moved or linked.
 pub fn account_folders(desktop_dir: &Path) -> Vec<PathBuf> {
+    if index_link(desktop_dir).is_some() {
+        return Vec::new();
+    }
     let mut folders = Vec::new();
     for account in uuid_entries(&desktop_dir.join(INDEX_DIR)) {
         if !fs::symlink_metadata(&account).is_ok_and(|m| m.is_dir()) {
@@ -72,6 +79,15 @@ pub fn account_folders(desktop_dir: &Path) -> Vec<PathBuf> {
     folders
 }
 
+/// Where `desktop_dir`'s index folder points when it is a symlink itself.
+fn index_link(desktop_dir: &Path) -> Option<PathBuf> {
+    let index = desktop_dir.join(INDEX_DIR);
+    fs::symlink_metadata(&index)
+        .ok()
+        .filter(|m| m.file_type().is_symlink())
+        .map(|_| fs::read_link(&index).unwrap_or_default())
+}
+
 /// Classify the item for the isolation check. `source_desktop_dir` is the
 /// sharing source's Desktop data dir (the existing Claude).
 pub fn inspect(
@@ -79,7 +95,15 @@ pub fn inspect(
     source_desktop_dir: &Path,
     provider: &dyn PlatformProvider,
 ) -> ItemHealth {
-    let targets = account_folders(&profile.isolation.desktop_user_data_dir);
+    let env_dir = &profile.isolation.desktop_user_data_dir;
+    // The index folder itself must never be a link, whatever the mode: CSW
+    // links one account folder at a time and never walks through it.
+    if let Some(actual) = index_link(env_dir) {
+        return ItemHealth::UnexpectedLink {
+            actual_target: display(&actual),
+        };
+    }
+    let targets = account_folders(env_dir);
     if mode(profile) != SharingMode::Share {
         return match targets.iter().find(|t| provider.is_symlink(t)) {
             Some(link) => ItemHealth::UnexpectedLink {
@@ -88,46 +112,64 @@ pub fn inspect(
             None => ItemHealth::IsolatedOk,
         };
     }
-    let source = match single(account_folders(source_desktop_dir)) {
-        Single::None => return ItemHealth::SourceAbsent,
-        Single::Many => return ItemHealth::AccountAmbiguous,
-        Single::One(source) => source,
-    };
-    let target = match single(targets) {
-        Single::None => {
-            return ItemHealth::PendingLaunch {
-                account_folder_exists: false,
-            };
-        }
-        Single::Many => return ItemHealth::AccountAmbiguous,
-        Single::One(target) => target,
-    };
-    if !provider.is_symlink(&target) {
-        return ItemHealth::PendingLaunch {
-            account_folder_exists: true,
+    let sources = account_folders(source_desktop_dir);
+    let links: Vec<&PathBuf> = targets.iter().filter(|t| provider.is_symlink(t)).collect();
+    // A link that already points at one of the existing Claude's account
+    // folders is the shared list, however many folders either side holds.
+    if let Some(actual) = links
+        .iter()
+        .find_map(|l| fs::read_link(l).ok().filter(|a| sources.contains(a)))
+    {
+        return ItemHealth::SharedOk {
+            target: display(&actual),
         };
     }
-    let actual = fs::read_link(&target).unwrap_or_default();
-    if actual == source {
-        ItemHealth::SharedOk {
-            target: display(&actual),
+    match links.as_slice() {
+        [] => {}
+        [link] => {
+            let actual = fs::read_link(link).unwrap_or_default();
+            // `metadata` follows the link: an error means its target is gone.
+            let dangling = fs::metadata(link).is_err();
+            return match sources.as_slice() {
+                // One source: the link can be re-pointed either way.
+                [source] => ItemHealth::WrongTarget {
+                    expected_source: display(source),
+                    actual_target: display(&actual),
+                    fixable: true,
+                },
+                _ if dangling => ItemHealth::SourceMissing {
+                    expected_source: display(&actual),
+                },
+                [] => ItemHealth::WrongTarget {
+                    expected_source: display(&source_desktop_dir.join(INDEX_DIR)),
+                    actual_target: display(&actual),
+                    fixable: false,
+                },
+                _ => ItemHealth::AccountAmbiguous,
+            };
         }
-    } else {
-        // The source is known and exists, so the link can always be re-pointed.
-        ItemHealth::WrongTarget {
-            expected_source: display(&source),
-            actual_target: display(&actual),
-            fixable: true,
-        }
+        _ => return ItemHealth::AccountAmbiguous,
+    }
+    match (sources.len(), targets.len()) {
+        (0, _) => ItemHealth::SourceAbsent,
+        (1, 0) => ItemHealth::PendingLaunch {
+            account_folder_exists: false,
+        },
+        (1, 1) => ItemHealth::PendingLaunch {
+            account_folder_exists: true,
+        },
+        _ => ItemHealth::AccountAmbiguous,
     }
 }
 
-/// Point the environment's account folder at the existing Claude's, when the
-/// item is shared and both sides hold exactly one account folder. A real
-/// folder in the way (the environment's own list) is kept under
-/// `<name>.csw-local` and restored if the link cannot be created. Returns
-/// whether anything changed. The caller makes sure the environment's Claude is
-/// not running.
+/// Point the environment's account folder at the existing Claude's. A link
+/// that already points at one of the existing Claude's account folders is
+/// left alone. Otherwise the existing Claude must hold exactly one account
+/// folder; a single wrong or dangling link is re-pointed, and a single real
+/// folder (the environment's own list) is kept under the next free
+/// `<name>.csw-local` name, restored if the link cannot be created. Returns
+/// whether anything changed. The caller makes sure the environment's Claude
+/// is not running.
 pub fn link(
     profile: &Profile,
     source_desktop_dir: &Path,
@@ -136,32 +178,43 @@ pub fn link(
     if mode(profile) != SharingMode::Share {
         return Ok(false);
     }
-    let (Single::One(source), Single::One(target)) = (
-        single(account_folders(source_desktop_dir)),
-        single(account_folders(&profile.isolation.desktop_user_data_dir)),
-    ) else {
+    let env_dir = &profile.isolation.desktop_user_data_dir;
+    if index_link(env_dir).is_some() {
+        return Ok(false);
+    }
+    let sources = account_folders(source_desktop_dir);
+    let targets = account_folders(env_dir);
+    let links: Vec<&PathBuf> = targets.iter().filter(|t| provider.is_symlink(t)).collect();
+    if links
+        .iter()
+        .any(|l| fs::read_link(l).is_ok_and(|a| sources.contains(&a)))
+    {
+        return Ok(false);
+    }
+    let [source] = sources.as_slice() else {
         return Ok(false);
     };
-    assert_outside_default_roots(&target, provider)?;
-
-    if provider.is_symlink(&target) {
-        if fs::read_link(&target).is_ok_and(|actual| actual == source) {
-            return Ok(false);
+    match links.as_slice() {
+        [] => {}
+        [link] => {
+            // Points elsewhere, or at a folder that is gone: swap the link.
+            assert_outside_default_roots(link, provider)?;
+            provider.remove_symlink(link)?;
+            provider.create_symlink(source, link)?;
+            return Ok(true);
         }
-        provider.remove_symlink(&target)?;
-        provider.create_symlink(&source, &target)?;
-        return Ok(true);
+        _ => return Ok(false),
     }
-
-    // The environment's own list is moved aside, never deleted. An earlier
-    // kept list is never overwritten: leave everything as it is instead.
-    let kept = kept_path(&target);
-    if fs::symlink_metadata(&kept).is_ok() {
+    let [target] = targets.as_slice() else {
         return Ok(false);
-    }
-    fs::rename(&target, &kept)?;
-    if let Err(e) = provider.create_symlink(&source, &target) {
-        let _ = fs::rename(&kept, &target);
+    };
+    assert_outside_default_roots(target, provider)?;
+
+    // The environment's own list is moved aside, never deleted or overwritten.
+    let kept = kept_path(target);
+    fs::rename(target, &kept)?;
+    if let Err(e) = provider.create_symlink(source, target) {
+        let _ = fs::rename(&kept, target);
         return Err(e);
     }
     Ok(true)
@@ -180,15 +233,21 @@ pub fn relink_after_clone(
         return Ok(());
     }
     let source_env_dir = &source_env.isolation.desktop_user_data_dir;
-    let (Single::One(linked), Single::One(source)) = (
-        single(account_folders(source_env_dir)),
-        single(account_folders(source_desktop_dir)),
-    ) else {
+    let sources = account_folders(source_desktop_dir);
+    // The source environment's shared link: the account folder that is a link
+    // into the existing Claude's index, whatever else sits beside it.
+    let Some((linked, source)) = account_folders(source_env_dir)
+        .into_iter()
+        .find_map(|folder| {
+            if !provider.is_symlink(&folder) {
+                return None;
+            }
+            let actual = fs::read_link(&folder).ok()?;
+            sources.contains(&actual).then_some((folder, actual))
+        })
+    else {
         return Ok(());
     };
-    if !provider.is_symlink(&linked) {
-        return Ok(());
-    }
     let Ok(relative) = linked.strip_prefix(source_env_dir) else {
         return Ok(());
     };
@@ -225,21 +284,6 @@ pub fn prepare_launch(profile: &Profile, provider: &dyn PlatformProvider) -> Res
     link(profile, &default_dir, provider)
 }
 
-/// Exactly one folder, or why not.
-enum Single {
-    None,
-    One(PathBuf),
-    Many,
-}
-
-fn single(mut folders: Vec<PathBuf>) -> Single {
-    match folders.len() {
-        0 => Single::None,
-        1 => Single::One(folders.remove(0)),
-        _ => Single::Many,
-    }
-}
-
 /// Entries of `dir` whose names are UUIDs. Names only; nothing is opened.
 fn uuid_entries(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -260,27 +304,54 @@ fn is_uuid(name: &str) -> bool {
         })
 }
 
-/// Sibling path the environment's own list is kept under.
+/// Sibling path the environment's own list is kept under: `<name>.csw-local`,
+/// or `<name>.csw-local-2`, `-3`, … when earlier kept lists are there. An
+/// earlier kept list is never overwritten.
 fn kept_path(target: &Path) -> PathBuf {
-    let mut name = target
+    let name = target
         .file_name()
-        .map(|n| n.to_os_string())
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    name.push(LOCAL_SUFFIX);
-    target.with_file_name(name)
+    let first = target.with_file_name(format!("{name}{LOCAL_SUFFIX}"));
+    if fs::symlink_metadata(&first).is_err() {
+        return first;
+    }
+    let mut n: u32 = 2;
+    loop {
+        let candidate = target.with_file_name(format!("{name}{LOCAL_SUFFIX}-{n}"));
+        if fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Defense in depth, mirroring the linker's guard: never move or link inside
-/// the user's real default Claude data dirs.
+/// the user's real default Claude data dirs. Both the literal path and where
+/// its parent folder really is are checked: a parent reached through a
+/// symlink would pass a textual comparison alone.
 fn assert_outside_default_roots(path: &Path, provider: &dyn PlatformProvider) -> Result<()> {
     let defaults = [
         provider.claude_desktop_default_dir(),
         provider.claude_cli_default_dir(),
     ];
-    if defaults.iter().any(|root| path.starts_with(root)) {
-        return Err(CswError::RefusedDefaultDataDeletion(
-            path.display().to_string(),
-        ));
+    let mut candidates = vec![path.to_path_buf()];
+    if let Some(real_parent) = path.parent().and_then(|p| p.canonicalize().ok()) {
+        candidates.push(match path.file_name() {
+            Some(name) => real_parent.join(name),
+            None => real_parent,
+        });
+    }
+    for root in &defaults {
+        let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if candidates
+            .iter()
+            .any(|c| c.starts_with(root) || c.starts_with(&real_root))
+        {
+            return Err(CswError::RefusedDefaultDataDeletion(
+                path.display().to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -500,18 +571,219 @@ mod tests {
     }
 
     #[test]
-    fn link_leaves_an_existing_kept_list_alone() {
+    fn link_keeps_a_second_environment_list_under_a_numbered_name() {
+        // An earlier kept list exists and the app has built a new own list
+        // (the link was removed and the account signed in again). The earlier
+        // kept list is untouched; the new one is kept under the next free
+        // number; the link is still made (SPECIFICATION.md §3「環境だけの一覧は消さない」).
         let f = shared();
-        account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        let source = account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
         let own = account_dir(&env_desktop(&f), ACCT_B, ORG_B, "local_b.json");
         let kept = own.with_file_name(format!("{ORG_B}{LOCAL_SUFFIX}"));
         fs::create_dir_all(&kept).unwrap();
         fs::write(kept.join("local_old.json"), "{}").unwrap();
 
-        assert!(!link(&f.profile, &f.default_desktop, &f.provider).unwrap());
-        assert!(!f.provider.is_symlink(&own));
-        assert!(own.join("local_b.json").exists());
+        assert!(link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        assert_eq!(fs::read_link(&own).unwrap(), source);
         assert!(kept.join("local_old.json").exists());
+        assert!(!kept.join("local_b.json").exists());
+        let kept2 = own.with_file_name(format!("{ORG_B}{LOCAL_SUFFIX}-2"));
+        assert!(
+            kept2.join("local_b.json").exists(),
+            "new own list kept as -2"
+        );
+
+        // A third time takes -3.
+        fs::remove_file(&own).unwrap();
+        account_dir(&env_desktop(&f), ACCT_B, ORG_B, "local_c.json");
+        assert!(link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        let kept3 = own.with_file_name(format!("{ORG_B}{LOCAL_SUFFIX}-3"));
+        assert!(
+            kept3.join("local_c.json").exists(),
+            "next own list kept as -3"
+        );
+        assert!(kept2.join("local_b.json").exists());
+    }
+
+    #[test]
+    fn a_dangling_link_is_source_missing_and_is_left_alone() {
+        // The existing Claude's account folder went away after linking.
+        let f = shared();
+        let source = account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        let own = account_dir(&env_desktop(&f), ACCT_B, ORG_B, "local_b.json");
+        link(&f.profile, &f.default_desktop, &f.provider).unwrap();
+        fs::remove_dir_all(&source).unwrap();
+
+        assert_eq!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::SourceMissing {
+                expected_source: source.display().to_string()
+            }
+        );
+        assert!(
+            ItemHealth::SourceMissing {
+                expected_source: String::new()
+            }
+            .is_issue()
+        );
+        // Nothing to re-point at: the link stays as it is.
+        assert!(!link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        assert!(f.provider.is_symlink(&own));
+
+        // Once a single account folder is back, the link is re-pointed.
+        let other = account_dir(&f.default_desktop, ACCT_A, ORG_B, "local_e.json");
+        assert!(matches!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::WrongTarget { fixable: true, .. }
+        ));
+        assert!(link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        assert_eq!(fs::read_link(&own).unwrap(), other);
+    }
+
+    #[test]
+    fn a_correct_link_stays_shared_ok_when_a_second_account_appears() {
+        let f = shared();
+        let source = account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        let own = account_dir(&env_desktop(&f), ACCT_B, ORG_B, "local_b.json");
+        link(&f.profile, &f.default_desktop, &f.provider).unwrap();
+
+        // A second account signs in to the existing Claude.
+        account_dir(&f.default_desktop, ACCT_B, ORG_A, "local_c.json");
+        assert_eq!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::SharedOk {
+                target: source.display().to_string()
+            }
+        );
+        assert!(!link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        assert_eq!(fs::read_link(&own).unwrap(), source);
+
+        // A second account signs in to the environment as well.
+        let other = account_dir(&env_desktop(&f), ACCT_A, ORG_B, "local_d.json");
+        assert!(matches!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::SharedOk { .. }
+        ));
+        assert!(!link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        assert!(!f.provider.is_symlink(&other));
+        assert!(other.join("local_d.json").exists());
+    }
+
+    #[test]
+    fn a_wrong_link_needs_a_single_source_account() {
+        let elsewhere_of = |f: &Fixture| {
+            let elsewhere = f._tmp.path().join("elsewhere");
+            fs::create_dir_all(&elsewhere).unwrap();
+            let own = env_desktop(f).join(INDEX_DIR).join(ACCT_B).join(ORG_B);
+            fs::create_dir_all(own.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &own).unwrap();
+            (elsewhere, own)
+        };
+
+        // Two accounts on the existing Claude side: cannot tell which to use.
+        let f = shared();
+        account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        account_dir(&f.default_desktop, ACCT_B, ORG_A, "local_c.json");
+        let (elsewhere, own) = elsewhere_of(&f);
+        assert_eq!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::AccountAmbiguous
+        );
+        assert!(!link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        assert_eq!(fs::read_link(&own).unwrap(), elsewhere);
+
+        // No account on the existing Claude side: nothing to re-point at.
+        let f = shared();
+        let (elsewhere, own) = elsewhere_of(&f);
+        assert!(matches!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::WrongTarget { fixable: false, .. }
+        ));
+        assert!(!link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        assert_eq!(fs::read_link(&own).unwrap(), elsewhere);
+    }
+
+    #[test]
+    fn a_linked_index_folder_is_never_walked_through() {
+        // The environment's whole claude-code-sessions/ is a link to the
+        // existing Claude's (a hand-made workaround). CSW must not reach the
+        // existing Claude's folders through it, let alone rename them.
+        let f = shared();
+        let source = account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        let index = env_desktop(&f).join(INDEX_DIR);
+        std::os::unix::fs::symlink(f.default_desktop.join(INDEX_DIR), &index).unwrap();
+
+        assert!(account_folders(&env_desktop(&f)).is_empty());
+        assert_eq!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::UnexpectedLink {
+                actual_target: f.default_desktop.join(INDEX_DIR).display().to_string()
+            }
+        );
+        assert!(!link(&f.profile, &f.default_desktop, &f.provider).unwrap());
+        assert!(source.join("local_a.json").exists());
+        let kept = source.with_file_name(format!("{ORG_A}{LOCAL_SUFFIX}"));
+        assert!(
+            !kept.exists(),
+            "nothing is renamed on the existing Claude side"
+        );
+        assert!(f.provider.is_symlink(&index));
+
+        // The same link in an isolated environment is an unexpected link too.
+        let f = fixture(SharingConfig::share_settings_preset());
+        account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        let index = env_desktop(&f).join(INDEX_DIR);
+        std::os::unix::fs::symlink(f.default_desktop.join(INDEX_DIR), &index).unwrap();
+        assert!(matches!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::UnexpectedLink { .. }
+        ));
+    }
+
+    #[test]
+    fn the_guard_sees_through_a_linked_parent_folder() {
+        // Defense in depth for the case above: a target whose parent folder
+        // really lives inside the existing Claude's data dir is refused even
+        // when its literal path is inside the environment.
+        let f = shared();
+        let source = account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        let account = env_desktop(&f).join(INDEX_DIR).join(ACCT_A);
+        fs::create_dir_all(account.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(f.default_desktop.join(INDEX_DIR).join(ACCT_A), &account)
+            .unwrap();
+        let target = account.join(ORG_A);
+        assert!(assert_outside_default_roots(&target, &f.provider).is_err());
+        assert!(source.join("local_a.json").exists());
+    }
+
+    #[test]
+    fn relink_after_clone_finds_the_link_among_other_account_folders() {
+        let f = shared();
+        let source = account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        account_dir(&env_desktop(&f), ACCT_B, ORG_B, "local_b.json");
+        link(&f.profile, &f.default_desktop, &f.provider).unwrap();
+        // A second account signed in to the source environment later.
+        account_dir(&env_desktop(&f), ACCT_A, ORG_B, "local_d.json");
+
+        let mut dup = f.profile.clone();
+        dup.profile.name = "work2".to_string();
+        dup.isolation.desktop_user_data_dir = f
+            ._tmp
+            .path()
+            .join("profiles")
+            .join("work2")
+            .join("desktop-data");
+        fs::create_dir_all(&dup.isolation.desktop_user_data_dir).unwrap();
+        relink_after_clone(&f.profile, &dup, &f.default_desktop, &f.provider).unwrap();
+
+        let path = dup
+            .isolation
+            .desktop_user_data_dir
+            .join(INDEX_DIR)
+            .join(ACCT_B)
+            .join(ORG_B);
+        assert!(f.provider.is_symlink(&path));
+        assert_eq!(fs::read_link(&path).unwrap(), source);
     }
 
     #[test]
@@ -570,13 +842,27 @@ mod tests {
             ItemHealth::WrongTarget { fixable: true, .. }
         ));
 
-        // A second account in the environment: ambiguous, an issue.
+        // Two accounts in the environment while the link is still to be
+        // made: ambiguous, an issue.
+        let f = shared();
+        account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        account_dir(&env_desktop(&f), ACCT_B, ORG_B, "local_b.json");
         account_dir(&env_desktop(&f), ACCT_A, ORG_B, "local_d.json");
         assert_eq!(
             inspect(&f.profile, &f.default_desktop, &f.provider),
             ItemHealth::AccountAmbiguous
         );
         assert!(ItemHealth::AccountAmbiguous.is_issue());
+
+        // Two accounts on the existing Claude side, no link yet: ambiguous.
+        let f = shared();
+        account_dir(&f.default_desktop, ACCT_A, ORG_A, "local_a.json");
+        account_dir(&f.default_desktop, ACCT_B, ORG_A, "local_c.json");
+        account_dir(&env_desktop(&f), ACCT_B, ORG_B, "local_b.json");
+        assert_eq!(
+            inspect(&f.profile, &f.default_desktop, &f.provider),
+            ItemHealth::AccountAmbiguous
+        );
 
         // Nothing on the existing Claude side.
         let f = shared();

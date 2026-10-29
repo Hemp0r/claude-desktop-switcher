@@ -187,6 +187,8 @@ const EN = {
   '常に分離する項目がリンクになっています。': 'An always-isolated item has become a link.',
   'コピーの項目がリンクになっています。': 'An item set to copy has become a link.',
   '分離の項目がリンクになっています。': 'An isolated item has become a link.',
+  '会話一覧のフォルダ全体がリンクになっています。CSWはアカウントのフォルダごとにリンクを作るため、自動では共有しません。この環境のClaudeを終了してリンクを外すと、次の起動で共有します。':
+    'The whole conversation-list folder is a link. CSW links one account folder at a time, so it does not share the list automatically. Quit this environment\'s Claude and remove the link; the next launch shares the list.',
   // Data map (場所のデータの内訳)
   '読み込んでいます…': 'Loading…',
   '内訳を読み込めませんでした。': 'The breakdown could not be loaded.',
@@ -694,9 +696,14 @@ function doctorStatus(item) {
   if (st === 'pending_launch') {
     return { status: item.health.account_folder_exists ? '次の起動で共有' : 'サインイン後の起動で共有', issue: false };
   }
+  // Only the Code-tab conversation list can be shared yet an unexpected link:
+  // its whole index folder is a link, which CSW never walks through
+  // (SPECIFICATION.md §3「Codeタブの会話一覧」).
   const unexpectedLink = ALWAYS_ISOLATED_KEYS.includes(item.key)
     ? '常に分離する項目がリンクになっています。'
-    : (item.mode === 'copy' ? 'コピーの項目がリンクになっています。' : '分離の項目がリンクになっています。');
+    : item.mode === 'share'
+      ? '会話一覧のフォルダ全体がリンクになっています。CSWはアカウントのフォルダごとにリンクを作るため、自動では共有しません。この環境のClaudeを終了してリンクを外すと、次の起動で共有します。'
+      : (item.mode === 'copy' ? 'コピーの項目がリンクになっています。' : '分離の項目がリンクになっています。');
   const detail = {
     source_missing: '共有元が見つかりません。',
     wrong_target: item.health.fixable

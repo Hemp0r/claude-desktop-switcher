@@ -2236,3 +2236,43 @@ fn clone_recreates_the_code_tab_link_and_copies_an_own_list() {
     assert!(!provider.is_symlink(&own));
     assert!(own.join("local_b.json").exists());
 }
+
+#[test]
+fn clone_skips_nested_symlinks_instead_of_failing() {
+    // SPECIFICATION.md §5.A「環境の複製」: links are never copied nor followed,
+    // at any depth, whether they point at a file or at a folder. Before this
+    // rule a folder link made the whole duplication fail in fs::copy.
+    let (_provider, manager, tmp) = setup_test_manager();
+    let profile = manager
+        .create_profile("isolated", SharingConfig::default(), None)
+        .unwrap();
+    let rules = profile.isolation.cli_config_dir.join("rules");
+    std::fs::create_dir_all(&rules).unwrap();
+    std::fs::write(rules.join("own.md"), "own").unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("shared.md"), "outside").unwrap();
+    std::os::unix::fs::symlink(outside.join("shared.md"), rules.join("linked.md")).unwrap();
+    std::os::unix::fs::symlink(&outside, rules.join("linked-dir")).unwrap();
+
+    let copy = manager.clone_profile("isolated", "isolated2").unwrap();
+
+    let copied = copy.isolation.cli_config_dir.join("rules");
+    assert_eq!(
+        std::fs::read_to_string(copied.join("own.md")).unwrap(),
+        "own"
+    );
+    assert!(
+        std::fs::symlink_metadata(copied.join("linked.md")).is_err(),
+        "a link to a file is not copied"
+    );
+    assert!(
+        std::fs::symlink_metadata(copied.join("linked-dir")).is_err(),
+        "a link to a folder is not copied"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("shared.md")).unwrap(),
+        "outside",
+        "the link target is untouched"
+    );
+}

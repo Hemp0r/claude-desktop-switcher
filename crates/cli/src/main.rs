@@ -678,22 +678,38 @@ be determined; nothing is linked automatically",
                 );
             }
             ItemHealth::UnexpectedLink { actual_target } => {
-                // Name the declared mode accurately: 常に分離する項目 is a fixed
-                // set (SPECIFICATION.md §3), not every isolated/copied item.
-                let declared = if is_always_isolated(item.key) {
-                    "must always stay isolated"
-                } else if matches!(item.mode, csw_core::profile::SharingMode::Copy) {
-                    "is declared as copy"
+                if item.key == csw_core::profile::code_sessions::KEY
+                    && matches!(item.mode, csw_core::profile::SharingMode::Share)
+                {
+                    // The whole index folder is a link, which CSW never walks
+                    // through (SPECIFICATION.md §3「Codeタブの会話一覧」).
+                    println!(
+                        "  {} {} is a link to {} as a whole; CSW links one account \
+folder at a time, so nothing is shared automatically. Quit this environment's \
+Claude and remove the link; the next launch shares the list",
+                        "!!".red().bold(),
+                        label,
+                        actual_target
+                    );
                 } else {
-                    "is declared isolated"
-                };
-                println!(
-                    "  {} {} {} but is a link to {}",
-                    "!!".red().bold(),
-                    label,
-                    declared,
-                    actual_target
-                );
+                    // Name the declared mode accurately: 常に分離する項目 is a
+                    // fixed set (SPECIFICATION.md §3), not every isolated/copied
+                    // item.
+                    let declared = if is_always_isolated(item.key) {
+                        "must always stay isolated"
+                    } else if matches!(item.mode, csw_core::profile::SharingMode::Copy) {
+                        "is declared as copy"
+                    } else {
+                        "is declared isolated"
+                    };
+                    println!(
+                        "  {} {} {} but is a link to {}",
+                        "!!".red().bold(),
+                        label,
+                        declared,
+                        actual_target
+                    );
+                }
             }
         }
     }
