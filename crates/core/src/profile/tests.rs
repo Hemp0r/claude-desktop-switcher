@@ -588,8 +588,8 @@ fn doctor_reports_healthy_share_profile() {
 
     assert_eq!(
         report.items.len(),
-        12,
-        "every linker-managed link point is checked"
+        13,
+        "every linker-managed link point and the Code-tab list are checked"
     );
     assert_eq!(
         report.issue_count, 0,
@@ -2037,4 +2037,242 @@ fn launch_desktop_stamps_last_launch_but_never_for_default() {
     let real_parent = default_dir.parent().unwrap();
     assert!(!real_parent.join("state.toml").exists());
     assert_eq!(manager.last_launched_at("default").unwrap(), None);
+}
+
+// --- Code-tab conversation list (SPECIFICATION.md §3「Codeタブの会話一覧」) ---
+
+const CS_ACCT_A: &str = "11111111-1111-4111-8111-111111111111";
+const CS_ORG_A: &str = "22222222-2222-4222-8222-222222222222";
+const CS_ACCT_B: &str = "33333333-3333-4333-8333-333333333333";
+const CS_ORG_B: &str = "44444444-4444-4444-8444-444444444444";
+
+/// `<desktop>/claude-code-sessions/<acct>/<org>/` holding one list entry.
+fn cs_account_dir(desktop: &std::path::Path, acct: &str, org: &str, entry: &str) -> PathBuf {
+    let dir = desktop.join(code_sessions::INDEX_DIR).join(acct).join(org);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(entry), "{}").unwrap();
+    dir
+}
+
+#[test]
+fn launch_links_the_code_tab_list_of_an_account_only_environment() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    let source = cs_account_dir(
+        &provider.claude_desktop_default_dir(),
+        CS_ACCT_A,
+        CS_ORG_A,
+        "local_a.json",
+    );
+    let profile = manager
+        .create_profile("research", SharingConfig::share_workspace_preset(), None)
+        .unwrap();
+    let own = cs_account_dir(
+        &profile.isolation.desktop_user_data_dir,
+        CS_ACCT_B,
+        CS_ORG_B,
+        "local_b.json",
+    );
+
+    crate::switcher::desktop::launch_desktop(&profile, provider.as_ref()).unwrap();
+
+    assert!(provider.is_symlink(&own));
+    assert_eq!(std::fs::read_link(&own).unwrap(), source);
+}
+
+#[test]
+fn launch_keeps_the_code_tab_list_of_other_modes() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    cs_account_dir(
+        &provider.claude_desktop_default_dir(),
+        CS_ACCT_A,
+        CS_ORG_A,
+        "local_a.json",
+    );
+    for (name, sharing) in [
+        ("settings", SharingConfig::share_settings_preset()),
+        ("isolated", SharingConfig::default()),
+    ] {
+        let profile = manager.create_profile(name, sharing, None).unwrap();
+        let own = cs_account_dir(
+            &profile.isolation.desktop_user_data_dir,
+            CS_ACCT_B,
+            CS_ORG_B,
+            "local_b.json",
+        );
+        crate::switcher::desktop::launch_desktop(&profile, provider.as_ref()).unwrap();
+        assert!(!provider.is_symlink(&own), "{name} must keep its own list");
+        assert!(own.join("local_b.json").exists());
+    }
+}
+
+#[test]
+fn isolation_check_reports_the_code_tab_list_after_the_link_items() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    cs_account_dir(
+        &provider.claude_desktop_default_dir(),
+        CS_ACCT_A,
+        CS_ORG_A,
+        "local_a.json",
+    );
+    manager
+        .create_profile("settings", SharingConfig::share_settings_preset(), None)
+        .unwrap();
+    let report = manager.inspect_profile_isolation("settings").unwrap();
+    assert_eq!(report.items.len(), linker::LINK_ITEMS.len() + 1);
+    let last = report.items.last().unwrap();
+    assert_eq!(last.key, code_sessions::KEY);
+    assert_eq!(last.health, inspector::ItemHealth::IsolatedOk);
+
+    manager
+        .create_profile("research", SharingConfig::share_workspace_preset(), None)
+        .unwrap();
+    let report = manager.inspect_profile_isolation("research").unwrap();
+    let last = report.items.last().unwrap();
+    assert_eq!(last.key, code_sessions::KEY);
+    assert_eq!(
+        last.health,
+        inspector::ItemHealth::PendingLaunch {
+            account_folder_exists: false
+        }
+    );
+    assert!(!last.is_issue);
+}
+
+#[test]
+fn doctor_fix_links_the_code_tab_list_unless_running() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    cs_account_dir(
+        &provider.claude_desktop_default_dir(),
+        CS_ACCT_A,
+        CS_ORG_A,
+        "local_a.json",
+    );
+    let profile = manager
+        .create_profile("research", SharingConfig::share_workspace_preset(), None)
+        .unwrap();
+    let own = cs_account_dir(
+        &profile.isolation.desktop_user_data_dir,
+        CS_ACCT_B,
+        CS_ORG_B,
+        "local_b.json",
+    );
+
+    // While the environment's Claude runs, the folder must not be moved.
+    let running = Arc::new(
+        MockPlatformProvider::new(
+            provider.claude_desktop_default_dir(),
+            provider.claude_cli_default_dir(),
+            provider.app_data_dir(),
+        )
+        .with_running_args(vec![format!(
+            "/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir={}",
+            profile.isolation.desktop_user_data_dir.display()
+        )]),
+    );
+    let running_manager = ProfileManager::new(running).unwrap();
+    let fixed = running_manager.doctor_fix_links("research").unwrap();
+    assert!(!fixed.contains(&code_sessions::KEY));
+    assert!(!provider.is_symlink(&own));
+
+    let fixed = manager.doctor_fix_links("research").unwrap();
+    assert!(fixed.contains(&code_sessions::KEY));
+    assert!(provider.is_symlink(&own));
+    let report = manager.inspect_profile_isolation("research").unwrap();
+    assert!(matches!(
+        report.items.last().unwrap().health,
+        inspector::ItemHealth::SharedOk { .. }
+    ));
+}
+
+#[test]
+fn clone_recreates_the_code_tab_link_and_copies_an_own_list() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    let source = cs_account_dir(
+        &provider.claude_desktop_default_dir(),
+        CS_ACCT_A,
+        CS_ORG_A,
+        "local_a.json",
+    );
+
+    // A linked account-only environment duplicates without error, and the
+    // duplicate links to the existing Claude's list at the same place.
+    let research = manager
+        .create_profile("research", SharingConfig::share_workspace_preset(), None)
+        .unwrap();
+    cs_account_dir(
+        &research.isolation.desktop_user_data_dir,
+        CS_ACCT_B,
+        CS_ORG_B,
+        "local_b.json",
+    );
+    crate::switcher::desktop::launch_desktop(&research, provider.as_ref()).unwrap();
+    let copy = manager.clone_profile("research", "research2").unwrap();
+    let link = copy
+        .isolation
+        .desktop_user_data_dir
+        .join(code_sessions::INDEX_DIR)
+        .join(CS_ACCT_B)
+        .join(CS_ORG_B);
+    assert!(provider.is_symlink(&link));
+    assert_eq!(std::fs::read_link(&link).unwrap(), source);
+
+    // An environment that keeps its own list duplicates it as real data.
+    let settings = manager
+        .create_profile("settings", SharingConfig::share_settings_preset(), None)
+        .unwrap();
+    cs_account_dir(
+        &settings.isolation.desktop_user_data_dir,
+        CS_ACCT_B,
+        CS_ORG_B,
+        "local_b.json",
+    );
+    let copy = manager.clone_profile("settings", "settings2").unwrap();
+    let own = copy
+        .isolation
+        .desktop_user_data_dir
+        .join(code_sessions::INDEX_DIR)
+        .join(CS_ACCT_B)
+        .join(CS_ORG_B);
+    assert!(!provider.is_symlink(&own));
+    assert!(own.join("local_b.json").exists());
+}
+
+#[test]
+fn clone_skips_nested_symlinks_instead_of_failing() {
+    // SPECIFICATION.md §5.A「環境の複製」: links are never copied nor followed,
+    // at any depth, whether they point at a file or at a folder. Before this
+    // rule a folder link made the whole duplication fail in fs::copy.
+    let (_provider, manager, tmp) = setup_test_manager();
+    let profile = manager
+        .create_profile("isolated", SharingConfig::default(), None)
+        .unwrap();
+    let rules = profile.isolation.cli_config_dir.join("rules");
+    std::fs::create_dir_all(&rules).unwrap();
+    std::fs::write(rules.join("own.md"), "own").unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("shared.md"), "outside").unwrap();
+    std::os::unix::fs::symlink(outside.join("shared.md"), rules.join("linked.md")).unwrap();
+    std::os::unix::fs::symlink(&outside, rules.join("linked-dir")).unwrap();
+
+    let copy = manager.clone_profile("isolated", "isolated2").unwrap();
+
+    let copied = copy.isolation.cli_config_dir.join("rules");
+    assert_eq!(
+        std::fs::read_to_string(copied.join("own.md")).unwrap(),
+        "own"
+    );
+    assert!(
+        std::fs::symlink_metadata(copied.join("linked.md")).is_err(),
+        "a link to a file is not copied"
+    );
+    assert!(
+        std::fs::symlink_metadata(copied.join("linked-dir")).is_err(),
+        "a link to a folder is not copied"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("shared.md")).unwrap(),
+        "outside",
+        "the link target is untouched"
+    );
 }

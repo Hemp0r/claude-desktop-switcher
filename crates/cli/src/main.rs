@@ -552,6 +552,7 @@ fn doctor_label(key: &str) -> &'static str {
         "desktop_device_id" => "Device ID (ant-did)",
         "desktop_app_config" => "Account sign-in (config.json)",
         "desktop_config" => "Connectors & app settings (claude_desktop_config.json)",
+        "desktop_code_sessions" => "Code tab conversation list (claude-code-sessions/)",
         _ => "Unknown item",
     }
 }
@@ -649,23 +650,66 @@ Not auto-fixed to avoid losing the local copy.",
                     expected_source
                 );
             }
-            ItemHealth::UnexpectedLink { actual_target } => {
-                // Name the declared mode accurately: 常に分離する項目 is a fixed
-                // set (SPECIFICATION.md §3), not every isolated/copied item.
-                let declared = if is_always_isolated(item.key) {
-                    "must always stay isolated"
-                } else if matches!(item.mode, csw_core::profile::SharingMode::Copy) {
-                    "is declared as copy"
+            ItemHealth::PendingLaunch {
+                account_folder_exists,
+            } => {
+                if *account_folder_exists {
+                    println!(
+                        "  {} {} share declared; linked on the next launch \
+(or run `csw doctor --fix` now)",
+                        "OK".green(),
+                        label
+                    );
                 } else {
-                    "is declared isolated"
-                };
+                    println!(
+                        "  {} {} share declared; linked on a launch after you sign in \
+and open the Code tab",
+                        "OK".green(),
+                        label
+                    );
+                }
+            }
+            ItemHealth::AccountAmbiguous => {
                 println!(
-                    "  {} {} {} but is a link to {}",
+                    "  {} {} more than one account folder, so the one to share cannot \
+be determined; nothing is linked automatically",
                     "!!".red().bold(),
-                    label,
-                    declared,
-                    actual_target
+                    label
                 );
+            }
+            ItemHealth::UnexpectedLink { actual_target } => {
+                if item.key == csw_core::profile::code_sessions::KEY
+                    && matches!(item.mode, csw_core::profile::SharingMode::Share)
+                {
+                    // The whole index folder is a link, which CSW never walks
+                    // through (SPECIFICATION.md §3「Codeタブの会話一覧」).
+                    println!(
+                        "  {} {} is a link to {} as a whole; CSW links one account \
+folder at a time, so nothing is shared automatically. Quit this environment's \
+Claude and remove the link; the next launch shares the list",
+                        "!!".red().bold(),
+                        label,
+                        actual_target
+                    );
+                } else {
+                    // Name the declared mode accurately: 常に分離する項目 is a
+                    // fixed set (SPECIFICATION.md §3), not every isolated/copied
+                    // item.
+                    let declared = if is_always_isolated(item.key) {
+                        "must always stay isolated"
+                    } else if matches!(item.mode, csw_core::profile::SharingMode::Copy) {
+                        "is declared as copy"
+                    } else {
+                        "is declared isolated"
+                    };
+                    println!(
+                        "  {} {} {} but is a link to {}",
+                        "!!".red().bold(),
+                        label,
+                        declared,
+                        actual_target
+                    );
+                }
             }
         }
     }
