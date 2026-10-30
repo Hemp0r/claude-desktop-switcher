@@ -2218,6 +2218,138 @@ fn clone_of_a_v0248_environment_gets_its_own_list_back() {
     assert!(source.join("local_a.json").exists());
 }
 
+/// Every symlink under `dir`, at any depth. Links are listed, never followed.
+fn cs_links_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return links;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            links.push(path);
+        } else if meta.is_dir() {
+            links.extend(cs_links_under(&path));
+        }
+    }
+    links
+}
+
+/// The rule behind the v0.24.8 regression: the Claude Desktop App never saves
+/// through a link in its data folder, so CSW must never leave one in the
+/// Code-tab list, in any mode, after any operation that touches an
+/// environment (create, launch, csw doctor --fix, duplicate). An environment
+/// that still carries v0.24.8's link must come out of each of them without it.
+#[test]
+fn no_operation_leaves_a_link_in_the_code_tab_list() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    cs_account_dir(
+        &provider.claude_desktop_default_dir(),
+        CS_ACCT_A,
+        CS_ORG_A,
+        "local_a.json",
+    );
+    let index = |p: &Profile| {
+        p.isolation
+            .desktop_user_data_dir
+            .join(code_sessions::INDEX_DIR)
+    };
+
+    for (name, sharing, from_v0248) in [
+        ("workspace", SharingConfig::share_workspace_preset(), false),
+        (
+            "workspace-v0248",
+            SharingConfig::share_workspace_preset(),
+            true,
+        ),
+        ("settings", SharingConfig::share_settings_preset(), false),
+        (
+            "settings-v0248",
+            SharingConfig::share_settings_preset(),
+            true,
+        ),
+        ("isolated", SharingConfig::default(), false),
+    ] {
+        let profile = manager.create_profile(name, sharing, None).unwrap();
+        assert!(
+            cs_links_under(&index(&profile)).is_empty(),
+            "{name}: create"
+        );
+
+        // Signed in: the app made its own list. Optionally as v0.24.8 left it.
+        if from_v0248 {
+            cs_v0248_state(&provider, &profile);
+        } else {
+            cs_account_dir(
+                &profile.isolation.desktop_user_data_dir,
+                CS_ACCT_B,
+                CS_ORG_B,
+                "local_b.json",
+            );
+        }
+
+        crate::switcher::desktop::launch_desktop(&profile, provider.as_ref()).unwrap();
+        assert!(
+            cs_links_under(&index(&profile)).is_empty(),
+            "{name}: launch"
+        );
+
+        if from_v0248 {
+            std::fs::remove_dir_all(index(&profile)).unwrap();
+            cs_v0248_state(&provider, &profile);
+        }
+        manager.doctor_fix_links(name).unwrap();
+        assert!(
+            cs_links_under(&index(&profile)).is_empty(),
+            "{name}: doctor --fix"
+        );
+
+        if from_v0248 {
+            std::fs::remove_dir_all(index(&profile)).unwrap();
+            cs_v0248_state(&provider, &profile);
+        }
+        let copy = manager
+            .clone_profile(name, &format!("{name}-copy"))
+            .unwrap();
+        assert!(
+            cs_links_under(&index(&copy)).is_empty(),
+            "{name}: duplicate"
+        );
+        crate::switcher::desktop::launch_desktop(&copy, provider.as_ref()).unwrap();
+        assert!(
+            cs_links_under(&index(&copy)).is_empty(),
+            "{name}: duplicate launch"
+        );
+
+        // Duplicating leaves the source as it was; its next launch repairs it.
+        crate::switcher::desktop::launch_desktop(&profile, provider.as_ref()).unwrap();
+        assert!(
+            cs_links_under(&index(&profile)).is_empty(),
+            "{name}: relaunch"
+        );
+
+        // The environment's own list is a real folder holding its own entry.
+        let own = index(&profile).join(CS_ACCT_B).join(CS_ORG_B);
+        assert!(std::fs::symlink_metadata(&own).unwrap().is_dir(), "{name}");
+        assert!(own.join("local_b.json").exists(), "{name}");
+    }
+
+    // The existing Claude's list was never written to.
+    let source = provider
+        .claude_desktop_default_dir()
+        .join(code_sessions::INDEX_DIR);
+    assert!(cs_links_under(&source).is_empty());
+    let entries: Vec<_> = std::fs::read_dir(source.join(CS_ACCT_A).join(CS_ORG_A))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("local_a.json")]);
+}
+
 #[test]
 fn clone_skips_nested_symlinks_instead_of_failing() {
     // SPECIFICATION.md §5.A「環境の複製」: links are never copied nor followed,
