@@ -688,12 +688,9 @@ impl ProfileManager {
         let sharing_source = self.get_profile(&target_profile.sharing.source.profile)?;
         let linker = linker::Linker::new(self.provider.as_ref());
         linker.link_profile(&target_profile, &sharing_source)?;
-        code_sessions::relink_after_clone(
-            &source_profile,
-            &target_profile,
-            &sharing_source.isolation.desktop_user_data_dir,
-            self.provider.as_ref(),
-        )?;
+        // A Code-tab list link left by v0.24.8 was skipped above, while the
+        // kept own list was copied as real data: put it back in place.
+        code_sessions::restore(&target_profile, self.provider.as_ref())?;
 
         // Save profile metadata
         config::save_profile(&target_profile, &target_toml)?;

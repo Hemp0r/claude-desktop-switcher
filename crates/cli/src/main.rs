@@ -650,43 +650,16 @@ Not auto-fixed to avoid losing the local copy.",
                     expected_source
                 );
             }
-            ItemHealth::PendingLaunch {
-                account_folder_exists,
-            } => {
-                if *account_folder_exists {
-                    println!(
-                        "  {} {} share declared; linked on the next launch \
-(or run `csw doctor --fix` now)",
-                        "OK".green(),
-                        label
-                    );
-                } else {
-                    println!(
-                        "  {} {} share declared; linked on a launch after you sign in \
-and open the Code tab",
-                        "OK".green(),
-                        label
-                    );
-                }
-            }
-            ItemHealth::AccountAmbiguous => {
-                println!(
-                    "  {} {} more than one account folder, so the one to share cannot \
-be determined; nothing is linked automatically",
-                    "!!".red().bold(),
-                    label
-                );
-            }
             ItemHealth::UnexpectedLink { actual_target } => {
-                if item.key == csw_core::profile::code_sessions::KEY
-                    && matches!(item.mode, csw_core::profile::SharingMode::Share)
-                {
-                    // The whole index folder is a link, which CSW never walks
-                    // through (SPECIFICATION.md §3「Codeタブの会話一覧」).
+                if item.key == csw_core::profile::code_sessions::KEY {
+                    // A link left by v0.24.8 (SPECIFICATION.md §3
+                    // 「Codeタブの会話一覧」): the Desktop app never saves
+                    // through it.
                     println!(
-                        "  {} {} is a link to {} as a whole; CSW links one account \
-folder at a time, so nothing is shared automatically. Quit this environment's \
-Claude and remove the link; the next launch shares the list",
+                        "  {} {} is a link to {}. The Claude Desktop App does not save \
+through links, so conversations started in this environment are lost when it quits. \
+The next launch from CSW, or `csw doctor --fix`, removes the link and restores \
+this environment's own list",
                         "!!".red().bold(),
                         label,
                         actual_target
