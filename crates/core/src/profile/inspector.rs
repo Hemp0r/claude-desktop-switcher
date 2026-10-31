@@ -55,25 +55,13 @@ pub enum ItemHealth {
     IsolatedOk,
     /// Copy/Isolate: a symlink was found where the item must be independent.
     UnexpectedLink { actual_target: String },
-    /// Share, Code-tab conversation list only (`profile::code_sessions`): the
-    /// link does not exist yet and is created on the environment's next launch.
-    /// `account_folder_exists` is false while the environment holds no account
-    /// folder yet (not signed in, or the Code tab never opened).
-    PendingLaunch { account_folder_exists: bool },
-    /// Share, Code-tab conversation list only: the existing Claude or the
-    /// environment holds more than one account folder, so the folder to share
-    /// cannot be determined. Nothing is linked automatically.
-    AccountAmbiguous,
 }
 
 impl ItemHealth {
     pub fn is_issue(&self) -> bool {
         !matches!(
             self,
-            ItemHealth::SharedOk { .. }
-                | ItemHealth::IsolatedOk
-                | ItemHealth::SourceAbsent
-                | ItemHealth::PendingLaunch { .. }
+            ItemHealth::SharedOk { .. } | ItemHealth::IsolatedOk | ItemHealth::SourceAbsent
         )
     }
 }
@@ -140,16 +128,12 @@ impl<'a> Inspector<'a> {
             })
             .collect();
 
-        // The Code-tab conversation list follows the link items; its folder
-        // names are only known after sign-in (SPECIFICATION.md §3).
-        let health = code_sessions::inspect(
-            profile,
-            &source_profile.isolation.desktop_user_data_dir,
-            self.provider,
-        );
+        // The Code-tab conversation list follows the link items. It is always
+        // isolated; a link left by v0.24.8 is an issue (SPECIFICATION.md §3).
+        let health = code_sessions::inspect(profile, self.provider);
         items.push(ItemReport {
             key: code_sessions::KEY,
-            mode: code_sessions::mode(profile),
+            mode: SharingMode::Isolate,
             is_issue: health.is_issue(),
             health,
         });
@@ -229,8 +213,8 @@ impl<'a> Inspector<'a> {
             fixed.push(item_report.key);
         }
 
-        // The Code-tab conversation list is linked as on launch: the
-        // environment's own list is kept aside, never removed. Moving it under
+        // The Code-tab conversation list is restored as on launch: v0.24.8's
+        // link is removed and the kept own list renamed back. Moving it under
         // a running Claude would pull its open list away, so it is skipped
         // while that environment runs, or when that cannot be determined.
         let running = self.provider.running_desktop_args().map(|args| {
@@ -240,13 +224,7 @@ impl<'a> Inspector<'a> {
                 &self.provider.claude_desktop_default_dir(),
             )
         });
-        if matches!(running, Ok(false))
-            && code_sessions::link(
-                profile,
-                &source_profile.isolation.desktop_user_data_dir,
-                self.provider,
-            )?
-        {
+        if matches!(running, Ok(false)) && code_sessions::restore(profile, self.provider)? {
             fixed.push(code_sessions::KEY);
         }
 

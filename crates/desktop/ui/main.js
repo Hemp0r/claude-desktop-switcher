@@ -170,10 +170,6 @@ const EN = {
   '正常に分離': 'Isolated (OK)',
   '正常にコピー': 'Copied (OK)',
   '共有元がまだありません': 'Nothing to share yet',
-  '次の起動で共有': 'Shared on next launch',
-  'サインイン後の起動で共有': 'Shared on a launch after sign-in',
-  'アカウントのフォルダが複数あるため、共有するフォルダを決められません。自動では共有しません。':
-    'There is more than one account folder, so the folder to share cannot be determined. It is not shared automatically.',
   '要確認': 'Needs attention',
   '共有元が見つかりません。': 'The shared source is missing.',
   'リンク先が想定と異なります。ターミナルで「csw doctor --fix」を実行すると張り直せます。':
@@ -189,8 +185,8 @@ const EN = {
   '常に分離する項目がリンクになっています。': 'An always-isolated item has become a link.',
   'コピーの項目がリンクになっています。': 'An item set to copy has become a link.',
   '分離の項目がリンクになっています。': 'An isolated item has become a link.',
-  '会話一覧のフォルダ全体がリンクになっています。CSWはアカウントのフォルダごとにリンクを作るため、自動では共有しません。この環境のClaudeを終了してリンクを外すと、次の起動で共有します。':
-    'The whole conversation-list folder is a link. CSW links one account folder at a time, so it does not share the list automatically. Quit this environment\'s Claude and remove the link; the next launch shares the list.',
+  'Codeタブの会話一覧がリンクになっています。Claudeデスクトップアプリはリンクを通して保存しないため、この環境で始めた会話はClaudeを終了すると失われます。CSWから次に起動すると、リンクを外してこの環境の一覧を元に戻します。ターミナルで「csw doctor --fix」を実行しても戻せます。':
+    "The Code tab conversation list is a link. The Claude Desktop App does not save through links, so conversations started in this environment are lost when Claude quits. The next launch from CSW removes the link and restores this environment's own list. You can also run csw doctor --fix in a terminal.",
   // Data map (場所のデータの内訳)
   '読み込んでいます…': 'Loading…',
   '内訳を読み込めませんでした。': 'The breakdown could not be loaded.',
@@ -330,7 +326,7 @@ const DOCTOR_LABELS = {
   desktop_config: 'コネクタ・アプリ設定',
   // The second file of desktop_ssh_connections (the remote folder per host).
   desktop_ssh_locations: 'SSHの作業フォルダ',
-  // Not a share-UI choice: follows cli_project_memory (SPECIFICATION.md §3
+  // Not a share-UI choice: always isolated (SPECIFICATION.md §3
   // 「Codeタブの会話一覧」), so it only appears in the check.
   desktop_code_sessions: 'Codeタブの会話一覧',
 };
@@ -699,17 +695,14 @@ function doctorStatus(item) {
     return { status: item.mode === 'copy' ? '正常にコピー' : '正常に分離', issue: false };
   }
   if (st === 'source_absent') return { status: '共有元がまだありません', issue: false };
-  // Code-tab conversation list only: linked by the next CSW launch.
-  if (st === 'pending_launch') {
-    return { status: item.health.account_folder_exists ? '次の起動で共有' : 'サインイン後の起動で共有', issue: false };
-  }
-  // Only the Code-tab conversation list can be shared yet an unexpected link:
-  // its whole index folder is a link, which CSW never walks through
+  // The Code-tab conversation list as a link is what v0.24.8 left behind; the
+  // app never saves through it, and the next launch or --fix restores it
   // (SPECIFICATION.md §3「Codeタブの会話一覧」).
+  const codeTabLink = item.key === 'desktop_code_sessions';
   const unexpectedLink = ALWAYS_ISOLATED_KEYS.includes(item.key)
     ? '常に分離する項目がリンクになっています。'
-    : item.mode === 'share'
-      ? '会話一覧のフォルダ全体がリンクになっています。CSWはアカウントのフォルダごとにリンクを作るため、自動では共有しません。この環境のClaudeを終了してリンクを外すと、次の起動で共有します。'
+    : codeTabLink
+      ? 'Codeタブの会話一覧がリンクになっています。Claudeデスクトップアプリはリンクを通して保存しないため、この環境で始めた会話はClaudeを終了すると失われます。CSWから次に起動すると、リンクを外してこの環境の一覧を元に戻します。ターミナルで「csw doctor --fix」を実行しても戻せます。'
       : (item.mode === 'copy' ? 'コピーの項目がリンクになっています。' : '分離の項目がリンクになっています。');
   const detail = {
     source_missing: '共有元が見つかりません。',
@@ -725,14 +718,15 @@ function doctorStatus(item) {
       : '共有のリンクが実体のファイルに置き換わっています。手元の内容を失わないよう、自動では直しません。',
     missing_link: '共有のリンクがありません。ターミナルで「csw doctor --fix」を実行すると作れます。',
     unexpected_link: unexpectedLink,
-    account_ambiguous: 'アカウントのフォルダが複数あるため、共有するフォルダを決められません。自動では共有しません。',
   }[st] || '状態を判定できませんでした。';
-  // The three repairs csw doctor --fix performs (inspector.rs): re-point a
-  // fixable wrong link, replace an empty folder, create a missing link. The
-  // report adds where to get csw when any of them applies.
+  // The repairs csw doctor --fix performs (inspector.rs): re-point a fixable
+  // wrong link, replace an empty folder, create a missing link, and restore
+  // the Code-tab conversation list. The report adds where to get csw when any
+  // of them applies.
   const usesCsw = (st === 'wrong_target' && !!item.health.fixable)
     || (st === 'materialized' && !!item.health.is_directory)
-    || st === 'missing_link';
+    || st === 'missing_link'
+    || (st === 'unexpected_link' && codeTabLink);
   return { status: '要確認', detail, issue: true, usesCsw };
 }
 

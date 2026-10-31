@@ -2060,33 +2060,46 @@ fn cs_account_dir(desktop: &std::path::Path, acct: &str, org: &str, entry: &str)
     dir
 }
 
-#[test]
-fn launch_links_the_code_tab_list_of_an_account_only_environment() {
-    let (provider, manager, _tmp) = setup_test_manager();
+/// The state v0.24.8 left in an "account only" environment: its account
+/// folder is a link to the existing Claude's list, and its own list is kept
+/// beside it under `<org>.csw-local`. Returns (link path, existing list).
+fn cs_v0248_state(provider: &MockPlatformProvider, profile: &Profile) -> (PathBuf, PathBuf) {
     let source = cs_account_dir(
         &provider.claude_desktop_default_dir(),
         CS_ACCT_A,
         CS_ORG_A,
         "local_a.json",
     );
-    let profile = manager
-        .create_profile("research", SharingConfig::share_workspace_preset(), None)
-        .unwrap();
     let own = cs_account_dir(
         &profile.isolation.desktop_user_data_dir,
         CS_ACCT_B,
         CS_ORG_B,
         "local_b.json",
     );
-
-    crate::switcher::desktop::launch_desktop(&profile, provider.as_ref()).unwrap();
-
-    assert!(provider.is_symlink(&own));
-    assert_eq!(std::fs::read_link(&own).unwrap(), source);
+    let kept = own.with_file_name(format!("{CS_ORG_B}{}", code_sessions::LOCAL_SUFFIX));
+    std::fs::rename(&own, &kept).unwrap();
+    std::os::unix::fs::symlink(&source, &own).unwrap();
+    (own, source)
 }
 
 #[test]
-fn launch_keeps_the_code_tab_list_of_other_modes() {
+fn launch_restores_the_list_a_v0248_link_replaced() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    let profile = manager
+        .create_profile("research", SharingConfig::share_workspace_preset(), None)
+        .unwrap();
+    let (own, source) = cs_v0248_state(&provider, &profile);
+
+    crate::switcher::desktop::launch_desktop(&profile, provider.as_ref()).unwrap();
+
+    assert!(!provider.is_symlink(&own), "the link is gone");
+    assert!(own.join("local_b.json").exists(), "the own list is back");
+    assert!(source.join("local_a.json").exists());
+    assert!(!source.join("local_b.json").exists());
+}
+
+#[test]
+fn launch_keeps_the_code_tab_list_of_every_mode() {
     let (provider, manager, _tmp) = setup_test_manager();
     cs_account_dir(
         &provider.claude_desktop_default_dir(),
@@ -2095,6 +2108,7 @@ fn launch_keeps_the_code_tab_list_of_other_modes() {
         "local_a.json",
     );
     for (name, sharing) in [
+        ("workspace", SharingConfig::share_workspace_preset()),
         ("settings", SharingConfig::share_settings_preset()),
         ("isolated", SharingConfig::default()),
     ] {
@@ -2114,56 +2128,49 @@ fn launch_keeps_the_code_tab_list_of_other_modes() {
 #[test]
 fn isolation_check_reports_the_code_tab_list_after_the_link_items() {
     let (provider, manager, _tmp) = setup_test_manager();
-    cs_account_dir(
-        &provider.claude_desktop_default_dir(),
-        CS_ACCT_A,
-        CS_ORG_A,
-        "local_a.json",
-    );
-    manager
-        .create_profile("settings", SharingConfig::share_settings_preset(), None)
-        .unwrap();
-    let report = manager.inspect_profile_isolation("settings").unwrap();
-    assert_eq!(report.items.len(), linker::LINK_ITEMS.len() + 1);
-    let last = report.items.last().unwrap();
-    assert_eq!(last.key, code_sessions::KEY);
-    assert_eq!(last.health, inspector::ItemHealth::IsolatedOk);
-
-    manager
-        .create_profile("research", SharingConfig::share_workspace_preset(), None)
-        .unwrap();
-    let report = manager.inspect_profile_isolation("research").unwrap();
-    let last = report.items.last().unwrap();
-    assert_eq!(last.key, code_sessions::KEY);
-    assert_eq!(
-        last.health,
-        inspector::ItemHealth::PendingLaunch {
-            account_folder_exists: false
-        }
-    );
-    assert!(!last.is_issue);
-}
-
-#[test]
-fn doctor_fix_links_the_code_tab_list_unless_running() {
-    let (provider, manager, _tmp) = setup_test_manager();
-    cs_account_dir(
-        &provider.claude_desktop_default_dir(),
-        CS_ACCT_A,
-        CS_ORG_A,
-        "local_a.json",
-    );
     let profile = manager
         .create_profile("research", SharingConfig::share_workspace_preset(), None)
         .unwrap();
-    let own = cs_account_dir(
+    cs_account_dir(
         &profile.isolation.desktop_user_data_dir,
         CS_ACCT_B,
         CS_ORG_B,
         "local_b.json",
     );
+    let report = manager.inspect_profile_isolation("research").unwrap();
+    assert_eq!(report.items.len(), linker::LINK_ITEMS.len() + 1);
+    let last = report.items.last().unwrap();
+    assert_eq!(last.key, code_sessions::KEY);
+    assert_eq!(last.mode, SharingMode::Isolate);
+    assert_eq!(last.health, inspector::ItemHealth::IsolatedOk);
+    assert!(!last.is_issue);
 
-    // While the environment's Claude runs, the folder must not be moved.
+    std::fs::remove_dir_all(
+        profile
+            .isolation
+            .desktop_user_data_dir
+            .join(code_sessions::INDEX_DIR),
+    )
+    .unwrap();
+    cs_v0248_state(&provider, &profile);
+    let report = manager.inspect_profile_isolation("research").unwrap();
+    let last = report.items.last().unwrap();
+    assert!(matches!(
+        last.health,
+        inspector::ItemHealth::UnexpectedLink { .. }
+    ));
+    assert!(last.is_issue);
+}
+
+#[test]
+fn doctor_fix_restores_the_code_tab_list_unless_running() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    let profile = manager
+        .create_profile("research", SharingConfig::share_workspace_preset(), None)
+        .unwrap();
+    let (own, _source) = cs_v0248_state(&provider, &profile);
+
+    // While the environment's Claude runs, its open list must not move.
     let running = Arc::new(
         MockPlatformProvider::new(
             provider.claude_desktop_default_dir(),
@@ -2178,69 +2185,175 @@ fn doctor_fix_links_the_code_tab_list_unless_running() {
     let running_manager = ProfileManager::new(running).unwrap();
     let fixed = running_manager.doctor_fix_links("research").unwrap();
     assert!(!fixed.contains(&code_sessions::KEY));
-    assert!(!provider.is_symlink(&own));
+    assert!(provider.is_symlink(&own));
 
     let fixed = manager.doctor_fix_links("research").unwrap();
     assert!(fixed.contains(&code_sessions::KEY));
-    assert!(provider.is_symlink(&own));
+    assert!(!provider.is_symlink(&own));
+    assert!(own.join("local_b.json").exists());
     let report = manager.inspect_profile_isolation("research").unwrap();
-    assert!(matches!(
+    assert_eq!(
         report.items.last().unwrap().health,
-        inspector::ItemHealth::SharedOk { .. }
-    ));
+        inspector::ItemHealth::IsolatedOk
+    );
 }
 
 #[test]
-fn clone_recreates_the_code_tab_link_and_copies_an_own_list() {
+fn clone_of_a_v0248_environment_gets_its_own_list_back() {
     let (provider, manager, _tmp) = setup_test_manager();
-    let source = cs_account_dir(
+    let research = manager
+        .create_profile("research", SharingConfig::share_workspace_preset(), None)
+        .unwrap();
+    let (_own, source) = cs_v0248_state(&provider, &research);
+
+    let copy = manager.clone_profile("research", "research2").unwrap();
+
+    let list = copy
+        .isolation
+        .desktop_user_data_dir
+        .join(code_sessions::INDEX_DIR)
+        .join(CS_ACCT_B)
+        .join(CS_ORG_B);
+    assert!(!provider.is_symlink(&list));
+    assert!(list.join("local_b.json").exists());
+    assert!(
+        !list
+            .with_file_name(format!("{CS_ORG_B}{}", code_sessions::LOCAL_SUFFIX))
+            .exists()
+    );
+    assert!(source.join("local_a.json").exists());
+}
+
+/// Every symlink under `dir`, at any depth. Links are listed, never followed.
+fn cs_links_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return links;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            links.push(path);
+        } else if meta.is_dir() {
+            links.extend(cs_links_under(&path));
+        }
+    }
+    links
+}
+
+/// The rule behind the v0.24.8 regression: the Claude Desktop App never saves
+/// through a link in its data folder, so CSW must never leave one in the
+/// Code-tab list, in any mode, after any operation that touches an
+/// environment (create, launch, csw doctor --fix, duplicate). An environment
+/// that still carries v0.24.8's link must come out of each of them without it.
+#[test]
+fn no_operation_leaves_a_link_in_the_code_tab_list() {
+    let (provider, manager, _tmp) = setup_test_manager();
+    cs_account_dir(
         &provider.claude_desktop_default_dir(),
         CS_ACCT_A,
         CS_ORG_A,
         "local_a.json",
     );
+    let index = |p: &Profile| {
+        p.isolation
+            .desktop_user_data_dir
+            .join(code_sessions::INDEX_DIR)
+    };
 
-    // A linked account-only environment duplicates without error, and the
-    // duplicate links to the existing Claude's list at the same place.
-    let research = manager
-        .create_profile("research", SharingConfig::share_workspace_preset(), None)
-        .unwrap();
-    cs_account_dir(
-        &research.isolation.desktop_user_data_dir,
-        CS_ACCT_B,
-        CS_ORG_B,
-        "local_b.json",
-    );
-    crate::switcher::desktop::launch_desktop(&research, provider.as_ref()).unwrap();
-    let copy = manager.clone_profile("research", "research2").unwrap();
-    let link = copy
-        .isolation
-        .desktop_user_data_dir
-        .join(code_sessions::INDEX_DIR)
-        .join(CS_ACCT_B)
-        .join(CS_ORG_B);
-    assert!(provider.is_symlink(&link));
-    assert_eq!(std::fs::read_link(&link).unwrap(), source);
+    for (name, sharing, from_v0248) in [
+        ("workspace", SharingConfig::share_workspace_preset(), false),
+        (
+            "workspace-v0248",
+            SharingConfig::share_workspace_preset(),
+            true,
+        ),
+        ("settings", SharingConfig::share_settings_preset(), false),
+        (
+            "settings-v0248",
+            SharingConfig::share_settings_preset(),
+            true,
+        ),
+        ("isolated", SharingConfig::default(), false),
+    ] {
+        let profile = manager.create_profile(name, sharing, None).unwrap();
+        assert!(
+            cs_links_under(&index(&profile)).is_empty(),
+            "{name}: create"
+        );
 
-    // An environment that keeps its own list duplicates it as real data.
-    let settings = manager
-        .create_profile("settings", SharingConfig::share_settings_preset(), None)
-        .unwrap();
-    cs_account_dir(
-        &settings.isolation.desktop_user_data_dir,
-        CS_ACCT_B,
-        CS_ORG_B,
-        "local_b.json",
-    );
-    let copy = manager.clone_profile("settings", "settings2").unwrap();
-    let own = copy
-        .isolation
-        .desktop_user_data_dir
-        .join(code_sessions::INDEX_DIR)
-        .join(CS_ACCT_B)
-        .join(CS_ORG_B);
-    assert!(!provider.is_symlink(&own));
-    assert!(own.join("local_b.json").exists());
+        // Signed in: the app made its own list. Optionally as v0.24.8 left it.
+        if from_v0248 {
+            cs_v0248_state(&provider, &profile);
+        } else {
+            cs_account_dir(
+                &profile.isolation.desktop_user_data_dir,
+                CS_ACCT_B,
+                CS_ORG_B,
+                "local_b.json",
+            );
+        }
+
+        crate::switcher::desktop::launch_desktop(&profile, provider.as_ref()).unwrap();
+        assert!(
+            cs_links_under(&index(&profile)).is_empty(),
+            "{name}: launch"
+        );
+
+        if from_v0248 {
+            std::fs::remove_dir_all(index(&profile)).unwrap();
+            cs_v0248_state(&provider, &profile);
+        }
+        manager.doctor_fix_links(name).unwrap();
+        assert!(
+            cs_links_under(&index(&profile)).is_empty(),
+            "{name}: doctor --fix"
+        );
+
+        if from_v0248 {
+            std::fs::remove_dir_all(index(&profile)).unwrap();
+            cs_v0248_state(&provider, &profile);
+        }
+        let copy = manager
+            .clone_profile(name, &format!("{name}-copy"))
+            .unwrap();
+        assert!(
+            cs_links_under(&index(&copy)).is_empty(),
+            "{name}: duplicate"
+        );
+        crate::switcher::desktop::launch_desktop(&copy, provider.as_ref()).unwrap();
+        assert!(
+            cs_links_under(&index(&copy)).is_empty(),
+            "{name}: duplicate launch"
+        );
+
+        // Duplicating leaves the source as it was; its next launch repairs it.
+        crate::switcher::desktop::launch_desktop(&profile, provider.as_ref()).unwrap();
+        assert!(
+            cs_links_under(&index(&profile)).is_empty(),
+            "{name}: relaunch"
+        );
+
+        // The environment's own list is a real folder holding its own entry.
+        let own = index(&profile).join(CS_ACCT_B).join(CS_ORG_B);
+        assert!(std::fs::symlink_metadata(&own).unwrap().is_dir(), "{name}");
+        assert!(own.join("local_b.json").exists(), "{name}");
+    }
+
+    // The existing Claude's list was never written to.
+    let source = provider
+        .claude_desktop_default_dir()
+        .join(code_sessions::INDEX_DIR);
+    assert!(cs_links_under(&source).is_empty());
+    let entries: Vec<_> = std::fs::read_dir(source.join(CS_ACCT_A).join(CS_ORG_A))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("local_a.json")]);
 }
 
 #[test]
