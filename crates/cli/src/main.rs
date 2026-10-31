@@ -501,11 +501,19 @@ sign-in state) can be restored by moving the folder back under profiles/."
                 if fix && report.items.iter().any(is_fixable) {
                     let fixed = manager.doctor_fix_links(env_name)?;
                     for key in &fixed {
-                        println!(
-                            "{} the share link for {} now points at its declared source",
-                            "FIXED".green(),
-                            doctor_label(key).cyan()
-                        );
+                        if *key == csw_core::profile::code_sessions::KEY {
+                            println!(
+                                "{} {}: removed the link and restored this environment's own list",
+                                "FIXED".green(),
+                                doctor_label(key).cyan()
+                            );
+                        } else {
+                            println!(
+                                "{} the share link for {} now points at its declared source",
+                                "FIXED".green(),
+                                doctor_label(key).cyan()
+                            );
+                        }
                     }
                     report = manager.inspect_profile_isolation(env_name)?;
                 }
@@ -524,8 +532,10 @@ sign-in state) can be restored by moving the folder back under profiles/."
 }
 
 /// Whether `--fix` may repair this item: a share link that resolves elsewhere
-/// while its declared source exists, a share link that is missing outright, or
-/// a real folder at the link point (replaced only if it turns out to be empty).
+/// while its declared source exists, a share link that is missing outright, a
+/// real folder at the link point (replaced only if it turns out to be empty),
+/// or a link v0.24.8 left in the Code-tab conversation list (removed, and the
+/// environment's own list restored; SPECIFICATION.md §3「Codeタブの会話一覧」).
 fn is_fixable(item: &csw_core::profile::inspector::ItemReport) -> bool {
     use csw_core::profile::inspector::ItemHealth;
     matches!(
@@ -533,7 +543,8 @@ fn is_fixable(item: &csw_core::profile::inspector::ItemReport) -> bool {
         ItemHealth::WrongTarget { fixable: true, .. }
             | ItemHealth::MissingLink { .. }
             | ItemHealth::Materialized { is_directory: true }
-    )
+    ) || (item.key == csw_core::profile::code_sessions::KEY
+        && matches!(item.health, ItemHealth::UnexpectedLink { .. }))
 }
 
 /// Human label for a link-point key. English terms match the GUI's EN
